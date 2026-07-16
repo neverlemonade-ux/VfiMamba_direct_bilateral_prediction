@@ -41,7 +41,7 @@ class VFIDataset(Dataset):
         all_seqs = sorted([
             d for d in os.listdir(data_root)
             if os.path.isdir(os.path.join(data_root, d))
-            and all(os.path.exists(os.path.join(data_root, d, f'im{i}.png')) for i in (1, 2, 3))
+            and all(os.path.exists(os.path.join(data_root, d, f'frame{i}.jpg')) for i in (1, 2, 3))
         ])
         if not all_seqs:
             raise RuntimeError(
@@ -97,10 +97,9 @@ class VFIDataset(Dataset):
 
     def __getitem__(self, idx):
         seq_dir = os.path.join(self.data_root, self.seqs[idx])
-        img0 = self._load(os.path.join(seq_dir, 'im1.png'))
-        gt = self._load(os.path.join(seq_dir, 'im2.png'))
-        img1 = self._load(os.path.join(seq_dir, 'im3.png'))
-
+        img0 = self._load(os.path.join(seq_dir, 'frame1.jpg'))
+        gt = self._load(os.path.join(seq_dir, 'frame2.jpg'))
+        img1 = self._load(os.path.join(seq_dir, 'frame3.jpg'))
         img0, gt, img1 = self._augment(img0, gt, img1)
 
         def to_tensor(im):

@@ -12,11 +12,13 @@ Changes vs. the original draft, made specifically for 2K fine-tuning:
 - LR lowered and given a short linear warmup before the cosine decay -- the
   original 2e-4 peak with no warmup is a from-scratch-training setting and
   is likely to disturb the pretrained weights on the first few steps of a
-  fine-tune.
+  fine-tune. The warmup/decay schedule is computed PER OPTIMIZER STEP, not
+  per epoch (see lr_schedule() docstring below for why per-epoch warmup
+  doesn't actually ramp anything with a small WARMUP_EPOCHS value).
 - The AMP + LapLoss combination is now safe (see model/loss.py -- the loss
-  now casts to float32 internally, since the pyramid helpers build float32
-  zero-tensors that previously could not be torch.cat'd against a float16
-  autocast tensor).
+  now runs its whole forward() under autocast(enabled=False), since conv2d
+  is autocast-whitelisted and would otherwise silently re-cast back to
+  float16 regardless of any .float() calls on the inputs).
 - A best-checkpoint and a last-checkpoint are tracked separately from the
   periodic per-epoch dumps, so you aren't left guessing which of 25 files
   to deploy.
@@ -82,7 +84,10 @@ ACCUM_STEPS  = 2                            # effective batch = BATCH_SIZE * ACC
 LR           = 5e-5                         # peak LR -- fine-tuning wants far less than the
                                              # 2e-4 you'd use to train this from scratch
 MIN_LR       = 1e-6
-WARMUP_EPOCHS = 1                           # linear warmup into LR, then cosine decay to MIN_LR
+WARMUP_EPOCHS = 1                           # linear warmup into LR, then cosine decay to MIN_LR.
+                                             # Applied PER STEP now (see lr_schedule), so this
+                                             # value means "ramp over the first 1 epoch's worth
+                                             # of steps", not "epoch 0 is the warmup epoch".
 WEIGHT_DECAY = 1e-4
 
 CROP_SIZE    = 384                          # must be a multiple of 32; larger than the usual
@@ -109,14 +114,45 @@ def worker_init_fn(worker_id):
     random.seed(seed)
 
 
-def lr_schedule(optimizer, epoch, total_epochs, warmup_epochs, base_lr, min_lr):
-    if epoch < warmup_epochs:
-        lr = base_lr * (epoch + 1) / warmup_epochs
+def lr_schedule(optimizer, global_step, steps_per_epoch, total_epochs,
+                 warmup_epochs, base_lr, min_lr):
+    """
+    Linear warmup + cosine decay, computed PER OPTIMIZER STEP.
+
+    WHY PER-STEP INSTEAD OF PER-EPOCH
+    ----------------------------------
+    An earlier version of this function took `epoch` instead of
+    `global_step` and was called once per epoch:
+
+        if epoch < warmup_epochs:
+            lr = base_lr * (epoch + 1) / warmup_epochs
+
+    With WARMUP_EPOCHS=1, epoch 0 hit `base_lr * (0+1)/1 == base_lr` --
+    the LR was already at its full peak value from the very first
+    training step of the very first epoch. There was no ramp at all;
+    warmup only "activated" at epoch granularity, and with a single
+    warmup epoch that epoch's LR was already the target value. That
+    directly undercuts the reason warmup exists here in the first place:
+    protecting the pretrained weights from a large LR on the first few
+    *steps* of a fine-tune, not the first *epoch*.
+
+    Computing everything in step units fixes this: the LR now ramps
+    smoothly from ~base_lr/warmup_steps up to base_lr across the first
+    `warmup_epochs * steps_per_epoch` optimizer steps, then cosine-decays
+    down to min_lr over the remaining steps. Call this once per training
+    step (passing the running `global_step`), not once per epoch.
+    """
+    warmup_steps = max(1, int(warmup_epochs * steps_per_epoch))
+    total_steps = int(total_epochs * steps_per_epoch)
+
+    if global_step < warmup_steps:
+        lr = base_lr * (global_step + 1) / warmup_steps
     else:
-        e = epoch - warmup_epochs
-        total = max(1, total_epochs - warmup_epochs - 1)
+        e = global_step - warmup_steps
+        total = max(1, total_steps - warmup_steps)
         cos = 0.5 * (1 + math.cos(math.pi * e / total))
         lr = min_lr + (base_lr - min_lr) * cos
+
     for g in optimizer.param_groups:
         g['lr'] = lr
     return lr
@@ -157,9 +193,9 @@ def evaluate_full_res(model, val_set, local, max_samples, device='cuda'):
     total, count = 0.0, 0
     for seq in val_set.seqs[:max_samples]:
         seq_dir = os.path.join(val_set.data_root, seq)
-        img0 = cv2.imread(os.path.join(seq_dir, 'im1.png'))
-        gt = cv2.imread(os.path.join(seq_dir, 'im2.png'))
-        img1 = cv2.imread(os.path.join(seq_dir, 'im3.png'))
+        img0 = cv2.imread(os.path.join(seq_dir, 'frame1.jpg'))
+        gt = cv2.imread(os.path.join(seq_dir, 'frame2.jpg'))
+        img1 = cv2.imread(os.path.join(seq_dir, 'frame3.jpg'))
         if img0 is None or gt is None or img1 is None:
             continue
 
@@ -252,18 +288,27 @@ def main():
     history = []
 
     for epoch in range(EPOCHS):
-        cur_lr = lr_schedule(optimizer, epoch, EPOCHS, WARMUP_EPOCHS, LR, MIN_LR)
-
         model.train()
         t0 = time.time()
         running_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
         n_steps = steps_per_epoch
+        # Holds the most recent LR set by lr_schedule() below, for the
+        # epoch-summary log line after the step loop. Seeded here in case
+        # n_steps is ever 0 (shouldn't happen, but keeps that log safe).
+        cur_lr = optimizer.param_groups[0]['lr']
+
         for step, (img0, gt, img1) in enumerate(train_loader):
             img0 = img0.cuda(non_blocking=True)
             gt = gt.cuda(non_blocking=True)
             img1 = img1.cuda(non_blocking=True)
             imgs = torch.cat((img0, img1), 1)
+
+            # LR is now updated every optimizer step, not once per epoch --
+            # see lr_schedule()'s docstring for why the old per-epoch
+            # version gave WARMUP_EPOCHS=1 no real ramp at all.
+            cur_lr = lr_schedule(optimizer, global_step, steps_per_epoch,
+                                  EPOCHS, WARMUP_EPOCHS, LR, MIN_LR)
 
             with torch.cuda.amp.autocast(enabled=AMP):
                 _, _, _, pred = model.net(imgs, timestep=0.5, scale=0, local=local)
@@ -291,6 +336,7 @@ def main():
                 log(f'  epoch {epoch+1}/{EPOCHS} | step {step+1}/{n_steps} '
                     f'(global {global_step}/{total_steps_all}) | '
                     f'loss {step_loss:.4f} | avg_loss {running_avg_loss:.4f} | '
+                    f'lr {cur_lr:.2e} | '
                     f'elapsed {format_time(elapsed_total)} | '
                     f'ETA {format_time(eta)}')
 
