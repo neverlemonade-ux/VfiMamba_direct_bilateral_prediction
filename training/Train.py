@@ -68,8 +68,8 @@ from dataset import VFIDataset
 from model.loss import LapLoss  # the repo's real loss -- requires model/matching.py to exist
 
 # ==================== SETTINGS -- edit these directly ====================
-DATA_ROOT    = '/path/to/your/triplets'     # folder of seq_xxxx/im1.png,im2.png,im3.png (native 2K res)
-PRETRAINED   = 'base_model/VFIMamba.pkl'    # '' to train from scratch
+DATA_ROOT    = 'C:/Users/zheny/Downloads/atd_12k/dataset/train_10k'     # folder of seq_xxxx/im1.png,im2.png,im3.png (native 2K res)
+PRETRAINED   = 'C:/Users/zheny/Downloads/VFIMamba.pkl'                  # '' to train from scratch
 
 RUN_NAME     = 'training_run1'              # change this per run -- everything (the full
                                              # console log plus checkpoints) is written under
@@ -77,7 +77,7 @@ RUN_NAME     = 'training_run1'              # change this per run -- everything 
                                              # side instead of being overwritten
 RUNS_DIR     = 'runs'
 
-EPOCHS       = 25
+EPOCHS       = 10
 BATCH_SIZE   = 4                            # physical batch; see ACCUM_STEPS below
 ACCUM_STEPS  = 2                            # effective batch = BATCH_SIZE * ACCUM_STEPS = 8
 
