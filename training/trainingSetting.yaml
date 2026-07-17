@@ -1,0 +1,136 @@
+# =====================================================================
+# VFIMamba full-resolution fine-tune config (Pipeline A)
+#
+# Every setting that used to live in the hardcoded SETTINGS block at the
+# top of train.py now lives here instead. Run with:
+#
+#   python train.py --config train_config.yaml
+#
+# --restore_ckpt on the command line overrides data.pretrained below, if
+# you want to swap checkpoints without editing/duplicating this file.
+#
+# ALL data handling (splitting, seeding, dynamic timestep, padding) is
+# implemented in dataset.py -- this file only configures it.
+# =====================================================================
+
+data:
+  data_root: /mnt/d/trainingData/train_10k   # folder of seq_xxxx/<frame_filenames>. Sequences can be
+                                              # mixed native resolution -- FullResVFIDataset loads each
+                                              # frame at its own native size (that's why train.batch_size
+                                              # is pinned to 1) and train.train_scale_auto below can
+                                              # pick a different flow-estimation downsample per sample
+                                              # based on that sample's own resolution.
+  pretrained: /mnt/c/Users/zheny/Downloads/VFIMamba.pkl   # '' or omit/null to train from scratch
+
+  # ALL evenly-spaced frames that might appear in a sequence directory, in
+  # temporal order. For a sequence dir with N of these present (N >= 3),
+  # img0 = first present frame, img1 = last present frame, and gt is a
+  # DYNAMICALLY CHOSEN interior frame -- timestep = (interior index)/(N-1),
+  # picked at random on every __getitem__ call during training (reproducible
+  # given the same run.seed -- see dataset.py). A sequence dir with only 3
+  # frames present always has timestep=0.5 (only one interior frame
+  # exists); more frames per folder gives more timestep variety ACROSS
+  # epochs, not more items within a single epoch -- one sequence dir always
+  # contributes exactly one training item, however many frames it has.
+  # Validation is different: every interior frame of every val sequence is
+  # enumerated once as its own fixed item at construction time (capped per
+  # sequence via val_max_interior_per_seq below), so val composition stays
+  # fixed across epochs.
+  # A sequence dir needs at least 3 of these present to be usable at all;
+  # you can list more frames here than some/most of your folders actually
+  # have -- frames listed here but missing from a given folder are just
+  # skipped for that folder, not an error.
+  frame_filenames:
+    - frame1.jpg
+    - frame2.jpg
+    - frame3.jpg
+    - frame4.jpg
+    - frame5.jpg
+
+  val_split: 0.2      # fraction of SEQUENCES (not items) held out for validation. Split happens by
+                       # sequence, before any interior-frame/timestep choice is made, so related items
+                       # from the same sequence can never leak across train/val.
+
+  # WHERE THE PHYSICAL SPLIT IS WRITTEN. dataset.py materializes data_root
+  # into these two folders (symlinks by default, see split_mode) at the
+  # start of every run, so you always have a durable, browsable record of
+  # exactly which sequences were trained on vs held out -- no need to
+  # re-derive the split later. Omit/null -> defaults to
+  # <runs_dir>/<run_name>/split/train and .../split/val.
+  train_out: null
+  val_out: null
+  split_mode: symlink   # 'symlink' (instant, no extra disk space -- good default) or 'copy'
+                         # (physically duplicates every sequence; only needed if train_out/val_out
+                         # must survive data_root being deleted or moved. For a few thousand 2K
+                         # sequences, 'copy' can mean tens of GB of extra disk use.)
+
+  num_workers: 4
+  flip_aug: false      # cheap augmentation that doesn't require cropping: random horizontal/vertical
+                        # flip + random temporal swap (img0 <-> img1). The temporal swap also flips
+                        # timestep -> (1 - timestep), which matters now that timestep varies -- skipping
+                        # that flip would train part of the augmented samples against the wrong target.
+  val_max_interior_per_seq: 4   # cap on how many interior frames one val sequence can contribute, so a
+                                 # single long sequence can't dominate (or blow up the runtime of) validation.
+                                 # Evenly subsampled, deterministic -- val composition never changes across epochs.
+
+run:
+  run_name: training_run_ATD10k   # change this per run -- log + checkpoints (and, by default, the
+                                   # physical train/val split) are written under runs/<run_name>/, so
+                                   # old runs are kept side by side instead of being overwritten
+  runs_dir: /mnt/d/vifmamba_runs
+  seed: 42   # seeds random / numpy / torch once at startup. This makes both the train/val sequence
+             # split AND the per-item dynamic interior-frame/timestep choice reproducible run-to-run
+             # for a given seed (DataLoader workers re-derive their own seed from this via
+             # worker_init_fn, so it also covers multi-worker loading).
+
+train:
+  epochs: 30
+  batch_size: 1         # physical batch. MUST stay 1: full-res sequences can be
+                         # different native sizes and can't be stacked into batch > 1.
+                         # main() raises an error if this isn't 1 -- use accum_steps
+                         # below for a larger effective batch instead.
+  accum_steps: 8         # effective batch = batch_size * accum_steps = 8
+
+  lr: 5.0e-5              # peak LR -- fine-tuning wants far less than the ~2e-4
+                         # you'd use to train this model from scratch
+  min_lr: 1.0e-6
+  warmup_epochs: 1        # linear warmup into LR, then cosine decay to min_lr.
+                         # Applied PER STEP (ramps smoothly over the first 1 epoch's worth
+                         # of optimizer steps, not "epoch 0 is the warmup epoch" -- see
+                         # lr_schedule()'s docstring in train.py for why per-step matters)
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  amp: true
+
+  pad_multiple: 32        # frames are padded up to this multiple inside dataset.py, before train.py
+                         # ever sees them; predictions are cropped back to the original h/w before
+                         # PSNR is computed.
+
+  train_scale: 0.5        # flat fallback value for the flow-estimation downsample factor (input/output
+                         # stay full-res; feature extraction and refine/warp still run at full native
+                         # resolution regardless of this value -- it only affects flow estimation).
+                         # Used directly whenever train_scale_auto.enabled is false below, and as the
+                         # safety-net value if train_scale_auto is enabled but a sample's resolution
+                         # doesn't fall under any configured threshold.
+
+  train_scale_auto:       # OPTIONAL: pick train_scale per-sample from that sample's own resolution
+                         # (computed in dataset.py) instead of using one flat value for the whole
+                         # (possibly mixed-resolution) dataset. Disabled by default -- flip enabled to
+                         # true and set thresholds to use it. If you hit an OOM on a given resolution
+                         # tier, move that tier's scale DOWN, never up (a larger scale means less
+                         # downsampling and costs MORE memory).
+    enabled: false
+    thresholds:            # [min_long_edge_px, scale] pairs, checked largest-threshold-first; the first
+                          # one a sample's long edge (max(h, w)) meets or exceeds wins. Order in the
+                          # list doesn't matter -- dataset.py always sorts descending before checking.
+      - [3000, 0.25]        # long edge >= 3000px (~4K and up) -> heaviest downsample
+      - [1500, 0.5]         # long edge >= 1500px (~2K)        -> medium downsample
+      - [0, 1.0]            # anything smaller (~1K and below) -> no downsample
+
+eval:
+  eval_full_res_every: 5          # epochs between logging full-resolution PSNR
+                                   # (val_loss itself is always full-res, every epoch --
+                                   # this only controls how often the extra PSNR pass runs)
+  eval_full_res_max_samples: null   # cap val sequences used for the PSNR pass (null = all)
+  save_every_epoch: true
+  log_every_steps: 10

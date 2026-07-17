@@ -1,146 +1,66 @@
 """
-Fine-tune VFIMamba (large variant) on a custom 2K triplet dataset, single-GPU
-(one RTX 3090).
+Fine-tune VFIMamba (large variant) on a custom multi-frame dataset,
+single-GPU (one RTX 3090).
 
-No CLI args -- just edit the SETTINGS block below and run:
-    python train.py
+All settings live in a YAML config file. Usage:
+    python train.py --config trainingSetting.yaml
+    python train.py --config trainingSetting.yaml --restore_ckpt ckpt/VFIMamba.pkl
 
-Changes vs. the original draft, made specifically for 2K fine-tuning:
-- Larger default crop (384, still a multiple of 32) so training patches see
-  motion at a scale closer to real 2K footage, with gradient accumulation to
-  keep the effective batch size at 8 despite the smaller physical batch.
-- LR lowered and given a short linear warmup before the cosine decay -- the
-  original 2e-4 peak with no warmup is a from-scratch-training setting and
-  is likely to disturb the pretrained weights on the first few steps of a
-  fine-tune. The warmup/decay schedule is computed PER OPTIMIZER STEP, not
-  per epoch (see lr_schedule() docstring below for why per-epoch warmup
-  doesn't actually ramp anything with a small WARMUP_EPOCHS value).
-- The AMP + LapLoss combination is now safe (see model/loss.py -- the loss
-  now runs its whole forward() under autocast(enabled=False), since conv2d
-  is autocast-whitelisted and would otherwise silently re-cast back to
-  float16 regardless of any .float() calls on the inputs).
-- A best-checkpoint and a last-checkpoint are tracked separately from the
-  periodic per-epoch dumps, so you aren't left guessing which of 25 files
-  to deploy.
-- A full-resolution evaluation pass runs every EVAL_FULL_RES_EVERY epochs,
-  padding real (uncropped) validation frames to a multiple of 32 and
-  reporting PSNR -- this is the number that actually reflects "is it
-  getting better at 2K", since the per-batch train/val loss is only ever
-  computed on small crops.
-- A worker_init_fn reseeds Python's random module per DataLoader worker,
-  since torch does not do this automatically and workers can otherwise
-  emit correlated augmentations.
+=== DATA HANDLING HAS MOVED TO dataset.py ===
+Everything about how sequences are discovered, split into train/val,
+augmented, given a dynamic per-item timestep, given a resolution-aware
+flow-estimation scale, and padded to a multiple of 32 now lives in
+dataset.py. This file calls dataset.prepare_datasets() once and receives
+two Datasets that already yield fully-prepared
+(img0, gt, img1, timestep, scale, orig_h, orig_w) tuples -- it never reads
+a frame off disk, touches a random seed, or pads a tensor itself. If you
+want to change how data is prepared, edit dataset.py; if you want to
+change how the model is trained on that data, edit this file.
 
-Notes carried over from the original draft:
-- Config file is configCustom.py, not config.py. Trainer.py hardcodes
-  `from config import *`, so we register configCustom in sys.modules under
-  the name "config" *before* importing Trainer -- this makes Trainer.py
-  pick up the large-variant settings without editing Trainer.py itself.
-- Single-GPU only (Model(-1) -> no DDP).
-- Warm-start loads the pretrained checkpoint with strict=False, reusing the
-  repo's own `convert()` so architecture drift in KEY NAMES doesn't hard-
-  fail. IMPORTANT: strict=False only tolerates missing/unexpected key
-  names, not shape mismatches -- if configCustom.MODEL_ARCH's F/depth/W
-  don't match what PRETRAINED was actually trained with, load_state_dict
-  will raise a size-mismatch error regardless of strict. This script
-  prints a warning if the mismatched-key fraction looks suspiciously high.
-- Your OWN fine-tuned checkpoints (saved by this script) are NOT
-  DDP-prefixed, so they're loaded directly without convert() if you ever
-  resume from one of your own saves (see is_ddp_ckpt below).
+Everything else (per-step warmup+cosine LR, checkpoint loading with shape
+checks, batch size pinned to 1 physical / N accumulated since full-res
+sequences can't be stacked, best/last checkpoint tracking, full-res PSNR
+folded into the regular validation loop) is unchanged from before -- see
+inline comments below.
 """
+import argparse
 import math
 import os
-import random
+import shutil
 import sys
 import time
 
-import cv2
-import numpy as np
 import torch
 import torch.nn.functional as F
+import yaml
 
 import configCustom
 sys.modules['config'] = configCustom  # Trainer.py does `from config import *` -- point it here
 
 from Trainer import Model, convert  # noqa: E402  (must come after the sys.modules patch above)
+from model_oldRepo import warplayer
 from configCustom import MODEL_CONFIG
-from dataset import VFIDataset
-from model.loss import LapLoss  # the repo's real loss -- requires model/matching.py to exist
+from model_oldRepo.loss import LapLoss  # the repo's real loss
 
-# ==================== SETTINGS -- edit these directly ====================
-DATA_ROOT    = 'C:/Users/zheny/Downloads/atd_12k/dataset/train_10k'     # folder of seq_xxxx/im1.png,im2.png,im3.png (native 2K res)
-PRETRAINED   = 'C:/Users/zheny/Downloads/VFIMamba.pkl'                  # '' to train from scratch
-
-RUN_NAME     = 'training_run1'              # change this per run -- everything (the full
-                                             # console log plus checkpoints) is written under
-                                             # runs/RUN_NAME/, so old runs are kept side by
-                                             # side instead of being overwritten
-RUNS_DIR     = 'runs'
-
-EPOCHS       = 10
-BATCH_SIZE   = 4                            # physical batch; see ACCUM_STEPS below
-ACCUM_STEPS  = 2                            # effective batch = BATCH_SIZE * ACCUM_STEPS = 8
-
-LR           = 5e-5                         # peak LR -- fine-tuning wants far less than the
-                                             # 2e-4 you'd use to train this from scratch
-MIN_LR       = 1e-6
-WARMUP_EPOCHS = 1                           # linear warmup into LR, then cosine decay to MIN_LR.
-                                             # Applied PER STEP now (see lr_schedule), so this
-                                             # value means "ramp over the first 1 epoch's worth
-                                             # of steps", not "epoch 0 is the warmup epoch".
-WEIGHT_DECAY = 1e-4
-
-CROP_SIZE    = 384                          # must be a multiple of 32; larger than the usual
-                                             # 256 so training patches better reflect 2K-scale
-                                             # motion. Drop to 256-320 first if you hit OOM,
-                                             # before lowering BATCH_SIZE further.
-NUM_WORKERS  = 4
-VAL_SPLIT    = 0.2
-SEED         = 42
-GRAD_CLIP    = 1.0
-AMP          = True
-
-SAVE_EVERY_EPOCH = True                     # keep a per-epoch dump as well as best/last
-EVAL_FULL_RES_EVERY = 5                     # epochs between full-resolution PSNR checks
-EVAL_FULL_RES_MAX_SAMPLES = 8               # how many val sequences to run at full res (slow)
-
-LOG_EVERY_STEPS = 10                        # print a progress line every N training steps
-# ===========================================================================
+from dataset import prepare_datasets, worker_init_fn
 
 
-def worker_init_fn(worker_id):
-    seed = torch.initial_seed() % 2**32
-    np.random.seed(seed)
-    random.seed(seed)
+def load_config(path):
+    with open(path) as f:
+        C = yaml.safe_load(f)
+    C['_source_path'] = path
+    return C
 
 
 def lr_schedule(optimizer, global_step, steps_per_epoch, total_epochs,
                  warmup_epochs, base_lr, min_lr):
     """
-    Linear warmup + cosine decay, computed PER OPTIMIZER STEP.
-
-    WHY PER-STEP INSTEAD OF PER-EPOCH
-    ----------------------------------
-    An earlier version of this function took `epoch` instead of
-    `global_step` and was called once per epoch:
-
-        if epoch < warmup_epochs:
-            lr = base_lr * (epoch + 1) / warmup_epochs
-
-    With WARMUP_EPOCHS=1, epoch 0 hit `base_lr * (0+1)/1 == base_lr` --
-    the LR was already at its full peak value from the very first
-    training step of the very first epoch. There was no ramp at all;
-    warmup only "activated" at epoch granularity, and with a single
-    warmup epoch that epoch's LR was already the target value. That
-    directly undercuts the reason warmup exists here in the first place:
-    protecting the pretrained weights from a large LR on the first few
-    *steps* of a fine-tune, not the first *epoch*.
-
-    Computing everything in step units fixes this: the LR now ramps
-    smoothly from ~base_lr/warmup_steps up to base_lr across the first
-    `warmup_epochs * steps_per_epoch` optimizer steps, then cosine-decays
-    down to min_lr over the remaining steps. Call this once per training
-    step (passing the running `global_step`), not once per epoch.
+    Linear warmup + cosine decay, computed PER OPTIMIZER STEP -- warmup
+    ramps smoothly from ~base_lr/warmup_steps up to base_lr across the
+    first `warmup_epochs * steps_per_epoch` steps, then cosine-decays to
+    min_lr. Must be called once per training step (passing the running
+    global_step), not once per epoch, or a single warmup_epoch reaches
+    peak LR on the very first step with no ramp at all.
     """
     warmup_steps = max(1, int(warmup_epochs * steps_per_epoch))
     total_steps = int(total_epochs * steps_per_epoch)
@@ -156,13 +76,6 @@ def lr_schedule(optimizer, global_step, steps_per_epoch, total_epochs,
     for g in optimizer.param_groups:
         g['lr'] = lr
     return lr
-
-
-def pad_to_multiple(x, multiple=32):
-    _, _, h, w = x.shape
-    ph = (multiple - h % multiple) % multiple
-    pw = (multiple - w % multiple) % multiple
-    return F.pad(x, (0, pw, 0, ph), mode='replicate'), h, w
 
 
 def format_time(seconds):
@@ -183,40 +96,89 @@ def psnr(pred, gt):
     return 10 * math.log10(1.0 / mse)
 
 
-@torch.no_grad()
-def evaluate_full_res(model, val_set, local, max_samples, device='cuda'):
-    """Runs inference on real, uncropped validation frames (padded to a
-    multiple of 32) and reports average PSNR. This is the number that
-    reflects actual 2K quality -- the crop-based train/val loss elsewhere
-    in this script only ever sees small patches."""
-    model.eval()
-    total, count = 0.0, 0
-    for seq in val_set.seqs[:max_samples]:
-        seq_dir = os.path.join(val_set.data_root, seq)
-        img0 = cv2.imread(os.path.join(seq_dir, 'frame1.jpg'))
-        gt = cv2.imread(os.path.join(seq_dir, 'frame2.jpg'))
-        img1 = cv2.imread(os.path.join(seq_dir, 'frame3.jpg'))
-        if img0 is None or gt is None or img1 is None:
-            continue
+def load_pretrained_with_shape_check(net, ckpt_path, log):
+    """
+    Warm-start `net` from `ckpt_path`, dropping any key whose checkpoint
+    tensor shape doesn't match the current model's shape instead of
+    letting load_state_dict raise. strict=False alone only tolerates
+    missing/unexpected KEY NAMES, not a shape mismatch on a key present in
+    both -- that still raises regardless of strict. This filters out
+    shape-mismatched keys manually first, so the rest of the checkpoint
+    still applies, and logs exactly what was dropped/missing/unexpected.
+    """
+    state = torch.load(ckpt_path, map_location='cuda')
+    is_ddp_ckpt = any('module.' in k for k in state.keys())
+    state = convert(state) if is_ddp_ckpt else state
 
-        def to_tensor(im):
-            t = torch.from_numpy(im.transpose(2, 0, 1).astype(np.float32) / 255.0)
-            return t.unsqueeze(0).to(device)
+    model_state = net.state_dict()
+    dropped = []
+    filtered = {}
+    for k, v in state.items():
+        if k in model_state and model_state[k].shape != v.shape:
+            dropped.append(f'{k}: ckpt{tuple(v.shape)} vs model{tuple(model_state[k].shape)}')
+        else:
+            filtered[k] = v
 
-        t0, tg, t1 = to_tensor(img0), to_tensor(gt), to_tensor(img1)
-        t0p, h, w = pad_to_multiple(t0)
-        t1p, _, _ = pad_to_multiple(t1)
-        imgs = torch.cat((t0p, t1p), 1)
-        _, _, _, pred = model.net(imgs, timestep=0.5, scale=0, local=local)
-        pred = pred[:, :, :h, :w]
-        total += psnr(pred, tg)
-        count += 1
-    model.train()
-    return total / max(1, count)
+    missing, unexpected = net.load_state_dict(filtered, strict=False)
+    total_keys = len(model_state)
+
+    log(f'  shape-mismatched keys (dropped, left at random/pretrained init): {len(dropped)}')
+    for d in dropped[:10]:
+        log(f'    {d}')
+    if len(dropped) > 10:
+        log(f'    ... and {len(dropped) - 10} more')
+    log(f'  missing keys (absent from checkpoint entirely): {len(missing)} / {total_keys}')
+    log(f'  unexpected keys (in checkpoint, not in model):  {len(unexpected)}')
+
+    bad = len(dropped) + len(missing)
+    if bad > 0.2 * total_keys or len(unexpected) > 0.2 * total_keys:
+        log('  WARNING: a large fraction of keys did not line up (shape '
+            'mismatch + missing + unexpected). If configCustom.MODEL_ARCH '
+            f'(F / depth / W) does not match the architecture {ckpt_path} '
+            'was actually trained with, this warm start is doing far less '
+            'than you think -- much of the network may still be at random '
+            'init.')
+
+    return dropped, missing, unexpected
 
 
-def main():
-    torch.backends.cudnn.benchmark = True
+def main(C):
+    torch.backends.cudnn.benchmark = False
+
+    d_cfg = C['data']
+    r_cfg = C['run']
+    t_cfg = C['train']
+    e_cfg = C['eval']
+
+    PRETRAINED         = d_cfg.get('pretrained') or ''    # '' / null -> train from scratch
+    RUN_NAME           = r_cfg['run_name']                # everything (log + checkpoints) goes under runs/<run_name>/
+    RUNS_DIR           = r_cfg['runs_dir']
+    SEED               = r_cfg.get('seed', 42)
+
+    EPOCHS             = t_cfg['epochs']
+    BATCH_SIZE         = t_cfg.get('batch_size', 1)       # physical batch; see ACCUM_STEPS below
+    if BATCH_SIZE != 1:
+        # full-res sequences can be different native sizes and can't be
+        # stacked into a batch > 1 -- see dataset.FullResVFIDataset.
+        raise ValueError(
+            f'train.batch_size must be 1 for full-res training (got {BATCH_SIZE}); '
+            f'use train.accum_steps in the yaml to get a larger effective batch instead')
+    ACCUM_STEPS        = t_cfg.get('accum_steps', 8)      # effective batch = BATCH_SIZE * ACCUM_STEPS
+
+    LR                 = float(t_cfg['lr'])                # peak LR -- fine-tuning wants far less than the
+                                                            # ~2e-4 you'd use to train this from scratch
+    MIN_LR             = float(t_cfg.get('min_lr', 1e-6))
+    WARMUP_EPOCHS      = t_cfg.get('warmup_epochs', 1)     # applied PER STEP -- see lr_schedule() docstring
+    WEIGHT_DECAY       = float(t_cfg.get('weight_decay', 1e-4))
+    GRAD_CLIP          = t_cfg.get('grad_clip', 1.0)
+    AMP                = t_cfg.get('amp', True)
+
+    NUM_WORKERS        = d_cfg.get('num_workers', 4)
+
+    EVAL_FULL_RES_EVERY       = e_cfg.get('eval_full_res_every', 5)
+    EVAL_FULL_RES_MAX_SAMPLES = e_cfg.get('eval_full_res_max_samples', None)
+    SAVE_EVERY_EPOCH          = e_cfg.get('save_every_epoch', True)
+    LOG_EVERY_STEPS           = e_cfg.get('log_every_steps', 10)
 
     run_dir = os.path.join(RUNS_DIR, RUN_NAME)
     ckpt_dir = os.path.join(run_dir, 'checkpoints')
@@ -232,45 +194,43 @@ def main():
 
     log(f'===== starting run "{RUN_NAME}" ==========================================')
     log(f'settings: epochs={EPOCHS} batch={BATCH_SIZE} accum={ACCUM_STEPS} '
-        f'crop={CROP_SIZE} lr={LR} min_lr={MIN_LR} warmup_epochs={WARMUP_EPOCHS} '
-        f'amp={AMP} data_root={DATA_ROOT} pretrained={PRETRAINED}')
+        f'seed={SEED} lr={LR} min_lr={MIN_LR} warmup_epochs={WARMUP_EPOCHS} '
+        f'amp={AMP} pretrained={PRETRAINED}')
     log(f'full log for this run: {log_path}')
 
-    train_set = VFIDataset(DATA_ROOT, mode='train', crop_size=CROP_SIZE,
-                            val_split=VAL_SPLIT, seed=SEED)
-    val_set = VFIDataset(DATA_ROOT, mode='val', crop_size=CROP_SIZE,
-                          val_split=VAL_SPLIT, seed=SEED)
-    log(f'train samples: {len(train_set)} | val samples: {len(val_set)}')
+    # Archive the exact config used for this run next to its checkpoints,
+    # so a run's settings are never ambiguous later.
+    if C.get('_source_path'):
+        try:
+            shutil.copy(C['_source_path'], os.path.join(run_dir, 'config.yaml'))
+        except OSError as ex:
+            log(f'  (could not archive config.yaml: {ex})')
 
+    # ---- ALL data handling (split, seeding, dynamic timestep, padding) ----
+    train_set, val_set = prepare_datasets(C, run_dir, log=log)
+    log(f'train items: {len(train_set)} | val items: {len(val_set)}')
+
+    # multiprocessing_context='fork' is pinned explicitly here because Python
+    # 3.14 changed the POSIX multiprocessing default from 'fork' to
+    # 'forkserver'. FullResVFIDataset.__getitem__ never touches CUDA (only
+    # cv2.imread + CPU tensor conversion), so 'fork' is safe here even though
+    # the model will already be on the GPU in the main process by the time
+    # these workers spawn -- only the main process ever calls into CUDA.
     train_loader = torch.utils.data.DataLoader(
         train_set, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=NUM_WORKERS, pin_memory=True, drop_last=True,
-        worker_init_fn=worker_init_fn)
+        worker_init_fn=worker_init_fn, multiprocessing_context='fork')
     val_loader = torch.utils.data.DataLoader(
         val_set, batch_size=BATCH_SIZE, shuffle=False,
         num_workers=NUM_WORKERS, pin_memory=True,
-        worker_init_fn=worker_init_fn)
+        worker_init_fn=worker_init_fn, multiprocessing_context='fork')
 
     model = Model(-1)  # local_rank=-1 -> single GPU, no DDP wrapper
 
-    # ---- warm start ----
+    # ---- warm start (shape-checked -- see load_pretrained_with_shape_check) ----
     if PRETRAINED and os.path.exists(PRETRAINED):
         log(f'warm-starting from {PRETRAINED}')
-        state = torch.load(PRETRAINED, map_location='cuda')
-        is_ddp_ckpt = any('module.' in k for k in state.keys())
-        state = convert(state) if is_ddp_ckpt else state
-        missing, unexpected = model.net.load_state_dict(state, strict=False)
-        total_keys = len(model.net.state_dict())
-        log(f'  missing keys:    {len(missing)} / {total_keys}')
-        log(f'  unexpected keys: {len(unexpected)}')
-        if len(missing) > 0.2 * total_keys or len(unexpected) > 0.2 * total_keys:
-            log('  WARNING: a large fraction of keys did not line up. '
-                'strict=False only tolerates missing/unexpected KEY NAMES, '
-                'not shape mismatches -- if configCustom.MODEL_ARCH '
-                '(F / depth / W) does not match the architecture '
-                f'{PRETRAINED} was actually trained with, this warm start '
-                'is likely doing far less than you think (most of the '
-                'network may still be at random init).')
+        load_pretrained_with_shape_check(model.net, PRETRAINED, log)
     else:
         log('no pretrained checkpoint given/found -- training from scratch')
 
@@ -286,32 +246,41 @@ def main():
     train_start = time.time()
     global_step = 0
     history = []
+    logged_resolutions = set()  # (w, h) already logged with their resolved scale, avoids log spam
 
     for epoch in range(EPOCHS):
+        warplayer.backwarp_tenGrid.clear()
         model.train()
         t0 = time.time()
         running_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
         n_steps = steps_per_epoch
-        # Holds the most recent LR set by lr_schedule() below, for the
-        # epoch-summary log line after the step loop. Seeded here in case
-        # n_steps is ever 0 (shouldn't happen, but keeps that log safe).
         cur_lr = optimizer.param_groups[0]['lr']
 
-        for step, (img0, gt, img1) in enumerate(train_loader):
+        # img0/gt/img1 arrive already padded to a multiple of 32; h/w are
+        # the ORIGINAL pre-padding dimensions (for cropping predictions
+        # back before PSNR later); timestep/scale are already resolved
+        # per-sample by dataset.py.
+        for step, (img0, gt, img1, timestep, scale, h, w) in enumerate(train_loader):
             img0 = img0.cuda(non_blocking=True)
             gt = gt.cuda(non_blocking=True)
             img1 = img1.cuda(non_blocking=True)
             imgs = torch.cat((img0, img1), 1)
 
-            # LR is now updated every optimizer step, not once per epoch --
-            # see lr_schedule()'s docstring for why the old per-epoch
-            # version gave WARMUP_EPOCHS=1 no real ramp at all.
+            step_timestep = float(timestep.item())  # batch_size is pinned to 1, see above
+            step_scale = float(scale.item())
+            h, w = int(h.item()), int(w.item())
+
+            if (w, h) not in logged_resolutions:
+                log(f'  detected resolution {w}x{h} (long edge {max(h, w)}px) '
+                    f'-> train_scale {step_scale}')
+                logged_resolutions.add((w, h))
+
             cur_lr = lr_schedule(optimizer, global_step, steps_per_epoch,
                                   EPOCHS, WARMUP_EPOCHS, LR, MIN_LR)
 
             with torch.cuda.amp.autocast(enabled=AMP):
-                _, _, _, pred = model.net(imgs, timestep=0.5, scale=0, local=local)
+                _, _, _, pred = model.net(imgs, timestep=step_timestep, scale=step_scale, local=local)
                 loss = criterion(pred, gt) / ACCUM_STEPS
 
             scaler.scale(loss).backward()
@@ -327,7 +296,6 @@ def main():
             running_loss += step_loss
             global_step += 1
 
-            # ---- live progress: loss / step count / epoch / ETA ----
             if global_step % LOG_EVERY_STEPS == 0 or (step + 1) == n_steps:
                 elapsed_total = time.time() - train_start
                 avg_step_time = elapsed_total / global_step
@@ -336,33 +304,48 @@ def main():
                 log(f'  epoch {epoch+1}/{EPOCHS} | step {step+1}/{n_steps} '
                     f'(global {global_step}/{total_steps_all}) | '
                     f'loss {step_loss:.4f} | avg_loss {running_avg_loss:.4f} | '
-                    f'lr {cur_lr:.2e} | '
+                    f'lr {cur_lr:.2e} | t {step_timestep:.3f} | scale {step_scale} | '
                     f'elapsed {format_time(elapsed_total)} | '
                     f'ETA {format_time(eta)}')
 
         train_loss = running_loss / max(1, n_steps)
 
-        # ---- crop-based validation (fast, comparable across epochs) ----
+        # ---- full-resolution validation: loss every epoch, PSNR on a cadence ----
         model.eval()
         val_loss = 0.0
+        want_psnr = (epoch + 1) % EVAL_FULL_RES_EVERY == 0 or (epoch + 1) == EPOCHS
+        psnr_total, psnr_count = 0.0, 0
         with torch.no_grad():
-            for img0, gt, img1 in val_loader:
+            for i, (img0, gt, img1, timestep, scale, h, w) in enumerate(val_loader):
                 img0 = img0.cuda(non_blocking=True)
                 gt = gt.cuda(non_blocking=True)
                 img1 = img1.cuda(non_blocking=True)
                 imgs = torch.cat((img0, img1), 1)
-                _, _, _, pred = model.net(imgs, timestep=0.5, scale=0, local=local)
+                step_timestep = float(timestep.item())
+                step_scale = float(scale.item())
+                h, w = int(h.item()), int(w.item())
+
+                _, _, _, pred = model.net(imgs, timestep=step_timestep, scale=step_scale, local=local)
                 val_loss += criterion(pred, gt).item()
+
+                do_psnr_this_sample = want_psnr and (
+                    EVAL_FULL_RES_MAX_SAMPLES is None or i < EVAL_FULL_RES_MAX_SAMPLES)
+                if do_psnr_this_sample:
+                    # Padding was appended (bottom/right only), so cropping
+                    # the first h rows / w cols out of both the padded
+                    # prediction and the padded gt exactly recovers the
+                    # original unpadded content for a fair PSNR.
+                    pred_cropped = pred[:, :, :h, :w]
+                    gt_cropped = gt[:, :, :h, :w]
+                    psnr_total += psnr(pred_cropped, gt_cropped)
+                    psnr_count += 1
         val_loss /= max(1, len(val_loader))
+        full_psnr_this_epoch = (psnr_total / psnr_count) if psnr_count else None
 
         elapsed = time.time() - t0
         msg = (f'epoch {epoch+1:03d}/{EPOCHS} | train_loss {train_loss:.4f} | '
                f'val_loss {val_loss:.4f} | lr {cur_lr:.2e} | {elapsed:.1f}s')
-
-        # ---- occasional full-resolution PSNR check ----
-        full_psnr_this_epoch = None
-        if (epoch + 1) % EVAL_FULL_RES_EVERY == 0 or (epoch + 1) == EPOCHS:
-            full_psnr_this_epoch = evaluate_full_res(model, val_set, local, EVAL_FULL_RES_MAX_SAMPLES)
+        if full_psnr_this_epoch is not None:
             msg += f' | full-res PSNR {full_psnr_this_epoch:.2f}dB'
         log(msg)
 
@@ -448,8 +431,6 @@ def main():
         with open(summary_path, 'w') as f:
             f.write(summary_text + '\n')
 
-        # Written directly (not through log()) so it isn't cluttered with a
-        # timestamp on every line -- it's meant to be read as one clean block.
         print('\n' + summary_text + '\n')
         log_file.write('\n' + summary_text + '\n')
         log_file.flush()
@@ -461,4 +442,16 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser(
+        description='Fine-tune VFIMamba on a full-resolution multi-frame dataset with dynamic timestep')
+    parser.add_argument('--config', required=True, type=str,
+                         help='path to YAML config file (all settings live here)')
+    parser.add_argument('--restore_ckpt', type=str, default=None,
+                         help='optional override for data.pretrained in the yaml')
+    args = parser.parse_args()
+
+    C = load_config(args.config)
+    if args.restore_ckpt:
+        C['data']['pretrained'] = args.restore_ckpt
+
+    main(C)

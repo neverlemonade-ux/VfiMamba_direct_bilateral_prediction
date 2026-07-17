@@ -1,0 +1,4 @@
+Train -             /home/zheny/vfimamba_env/bin/python3 -u Train.py
+
+
+Second Terminal watching GPU usage - watch -n 1 nvidia-smi
