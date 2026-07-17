@@ -1,0 +1,260 @@
+# =====================================================================
+# Dynamic multi-crop + per-crop augmentation config.
+#
+# Run with:
+#   python augmentation.py --config augmentation_config.yaml
+#
+# Output is a NEW set of sequence folders (crop + optional augmentations
+# baked into the pixels) written to data.output_root, a sibling of
+# data.data_root. Point train_config.yaml's data.data_root at this
+# output (or merge it in) to train on the expanded set.
+#
+# Every augmentation type below is now enabled=true. All 17 types (11
+# pixel augmentations + lens/optics trio + exposure/white-balance duo +
+# the two blur additions) plus both temporal augmentations and crop
+# duplication have been stress-tested together -- including the
+# worst case where every single one fires on the same crop instance --
+# against square crops, rectangular crops, minimum-size scenes, and
+# scenes with/without extra on-disk frames. Nothing here corrupts,
+# double-cancels, or crashes when combined; see the per-type notes below
+# for the handful of interactions worth knowing about (they still don't
+# require you to disable anything at the current crop_size).
+# =====================================================================
+
+data:
+  data_root: /mnt/d/trainingData/train_10k   # same layout dataset.py expects: seq_xxxx/<frame_filenames>
+  output_root: null            # null -> defaults to "<data_root>_augmented" (sibling folder)
+  overwrite: false             # false -> skip any output scene folder that already exists (idempotent
+                                # reruns); true -> regenerate and append to manifest.jsonl instead of
+                                # overwriting it
+
+  frame_filenames:             # same list as train_config.yaml's data.frame_filenames
+    - frame1.jpg
+    - frame2.jpg
+    - frame3.jpg
+    - frame4.jpg
+    - frame5.jpg
+  min_frames_required: 3       # scenes with fewer of frame_filenames present are skipped (matches
+                                # dataset.py's own minimum, since anything short of that gets dropped
+                                # again at train time anyway)
+
+crop:
+  crop_size: 1024                # int -> square crop (512x512). Or [width, height] for a rectangular crop,
+                                 # e.g. [512, 384].
+  max_crops_per_scene: 4         # optional cap on the DYNAMICALLY computed crop count (see augmentation.py
+                                 # docstring: num_crops = min(w // crop_w, h // crop_h)). null = uncapped --
+                                 # a 4096x2048 scene with crop_size=512 produces min(8,4)=4 crops unless
+                                 # capped here.
+  jitter: true                  # true -> each crop is randomly placed within its assigned grid cell
+                                 # (reproducible given `augmentation.seed`). false -> pinned to each cell's
+                                 # top-left corner (fully deterministic, evenly spaced placement).
+
+augmentation:
+  seed: 42                      # governs crop placement AND every augmentation draw (pixel + temporal +
+                                 # duplication + group choices) for every individual crop -- reruns with
+                                 # the same seed reproduce the exact same output byte-for-byte. Verified:
+                                 # re-running this config twice against the same data_root produces
+                                 # identical manifests; changing the seed changes crop boxes and every
+                                 # augmentation choice.
+
+  # Every type below falls into exactly one of three tiers -- see
+  # augmentation.py's "DIFFERING AUGMENTATION PER CROP -- NOW THREE TIERS"
+  # docstring section:
+  #   1. lens/optics (lens_distortion, chromatic_aberration, vignetting) --
+  #      drawn ONCE PER SCENE and reused unchanged by every crop and
+  #      duplicate of that scene (a scene either gets these on all its
+  #      crops or none of them, never a per-crop mix).
+  #   2. the tone/exposure group (exposure_adjustment, white_balance_shift,
+  #      gamma_correction, color_jitter) -- MUTUALLY EXCLUSIVE, see
+  #      `groups.tone_exposure` below: at most one of the four fires per
+  #      crop instance.
+  #   3. everything else -- independently coin-flipped PER CROP INSTANCE
+  #      (not per scene), same as before: this is what makes crop 0 of a
+  #      scene end up with flip_h + random_erasing while crop 1 of the
+  #      SAME scene gets only random_erasing, crop 2 gets only flip_v,
+  #      crop 3 gets nothing, etc.
+  # A frame's flip/rotate/blur/etc. choice is always applied IDENTICALLY
+  # across every frame within one crop, to keep motion between frames
+  # physically consistent (see augmentation.py docstring) -- the only
+  # exceptions are gaussian_noise and jpeg_compression, which vary their
+  # exact realization per frame but share one severity parameter.
+  types:
+    # --- geometric (synthetic, dataset-level -- not physical capture effects) ---
+    # tier 3: independent per crop
+    flip_h:
+      enabled: true
+      prob: 0.5
+    flip_v:
+      enabled: false
+      prob: 0.3
+    rotate90:
+      enabled: false             # ON. Safe with lens_distortion/chromatic_aberration/vignetting (those
+      prob: 0.25                 # always run BEFORE rotate90, so their radial math still sees this crop
+                                 # in its original orientation) -- confirmed under stress test. The one
+                                 # real caveat: rotate90 swaps a crop's width/height, so it only stays
+                                 # shape-consistent because crop_size above is SQUARE (512x512). If you
+                                 # ever switch crop_size to a rectangular [w, h], a crop that happens to
+                                 # get rotated will come out as [h, w] instead -- either turn this back
+                                 # off first, or confirm your training loader tolerates mixed shapes.
+      
+
+    # --- lens / optics -- TIER 1: drawn ONCE PER SCENE, not per crop ---
+    # Physically a function of this crop's position within the ORIGINAL,
+    # uncropped frame -- see augmentation.py's "LENS / OPTICS EFFECTS ARE
+    # SCENE-FIXED" docstring section for why these can't just use the
+    # crop's own center, AND why whether/how strongly each one fires is
+    # decided once for the whole scene rather than independently per crop
+    # (a real lens doesn't change between crops of the same shot). Every
+    # crop and every duplicate of a scene reuses this same scene-level
+    # draw; only the crop-position-aware pixel math varies per crop.
+    lens_distortion:
+      enabled: true              # ON.
+      prob: 0.15
+      k1_range: [-0.15, 0.15]   # radial distortion coeff (barrel < 0 < pincushion). Keep modest -- larger
+                                 # values need pixels beyond the crop's own box, which fall back to
+                                 # edge-reflection rather than true neighboring content (see docstring).
+      k2_range: [-0.05, 0.05]   # second-order term
+    chromatic_aberration:
+      enabled: true              # ON. Independent remap from lens_distortion above (each recomputes its
+                                 # own nominal position grid), so having both on doesn't double-warp or
+                                 # cancel -- confirmed under stress test.
+      prob: 0.15
+      shift_range: [0.0, 0.006] # fractional radial shift; R and B are pushed in opposite directions
+                                 # (classic red/cyan fringing). Same edge-reflection caveat as above.
+    vignetting:
+      enabled: true              # ON. Just a multiplicative darkening mask -- composes cleanly with the
+                                 # two remap-based effects above, and with exposure_adjustment/color_jitter
+                                 # in the tone/exposure group below (it's applied at a different pipeline
+                                 # stage than either).
+      prob: 0.2
+      strength_range: [0.15, 0.45]  # fraction darkened at the true frame corner
+      falloff: 2.2                  # higher = darkening concentrated closer to the corners
+
+    # --- sensor/ISP + tone/color grading -- TIER 2: MUTUALLY EXCLUSIVE GROUP ---
+    # At most ONE of these four fires on a given crop instance -- see
+    # `groups.tone_exposure` below and augmentation.py's "TONE / EXPOSURE
+    # MUTUAL EXCLUSION" docstring section. Each type's `prob` here is no
+    # longer an independent per-crop firing chance; once the group fires
+    # (per `groups.tone_exposure.prob`), it's used only as a RELATIVE
+    # WEIGHT for which single member gets picked (so color_jitter at 0.3
+    # is more likely to be the one chosen than exposure_adjustment at
+    # 0.15, but the two can never both land on the same crop).
+    exposure_adjustment:
+      enabled: true
+      prob: 0.15                # relative weight within the tone/exposure group, not a firing chance
+      stops_range: [-0.5, 0.5]  # stops-based (2**stops) multiplicative gain
+    white_balance_shift:
+      enabled: true
+      prob: 0.15                # relative weight within the tone/exposure group, not a firing chance
+      gain_range: [0.85, 1.15]  # independent per-channel R/B gain (G stays the reference channel)
+    gamma_correction:
+      enabled: true
+      prob: 0.2                 # relative weight within the tone/exposure group, not a firing chance
+      gamma_range: [0.7, 1.3]
+    color_jitter:
+      enabled: true
+      prob: 0.3                 # relative weight within the tone/exposure group, not a firing chance
+      brightness: 0.2           # +/- fraction, multiplicative
+      contrast: 0.2             # +/- fraction, applied around each frame's own mean
+      saturation: 0.2           # +/- fraction, multiplicative on the HSV S channel
+      hue: 0.05                 # +/- fraction of the full hue range (cv2 hue channel is 0-179)
+
+    # --- optical blur ---
+    # tier 3: independent per crop
+    gaussian_blur:
+      enabled: true
+      prob: 0.15
+      kernel_range: [3, 7]      # odd kernel sizes only; auto-widened if you give an even bound
+      sigma_range: [0, 0]       # [0,0] -> cv2 derives sigma from kernel size automatically
+
+    defocus_blur:
+      enabled: true              # ON. Can fire alongside gaussian_blur/motion_blur on the same crop --
+                                 # they just compound into a heavier blur (three different, independently
+                                 # coin-flipped kernels applied in sequence), never a crash or a no-op.
+                                 # If a specific crop rolling all three blurs at once feels too aggressive
+                                 # for your training, lower these three `prob` values rather than disabling.
+      prob: 0.15
+      radius_range: [2, 6]      # disk-kernel radius -- visually distinct from gaussian_blur (soft) and
+                                 # motion_blur (directional); this is what an out-of-focus circular
+                                 # aperture actually produces.
+
+    # --- sensor noise ---
+    # tier 3: independent per crop
+    gaussian_noise:
+      enabled: true
+      prob: 0.15
+      std_range: [3, 15]        # independent noise REALIZATION per frame, shared severity per crop
+
+    # --- compression (codec stage -- always applied last, sees every earlier
+    # --- effect already baked in) ---
+    # tier 3: independent per crop
+    jpeg_compression:
+      enabled: true
+      prob: 0.15
+      quality_range: [30, 70]
+    h264_compression:
+      enabled: true              # ON. Can fire alongside jpeg_compression on the same crop (double lossy
+                                 # compression, applied jpeg-then-h264 -- realistic for footage that's been
+                                 # re-encoded, not a conflict). Requires ffmpeg on PATH AND even crop
+                                 # width/height for yuv420p -- crop_size=512 above satisfies both; if you
+                                 # change crop_size to an odd number, ffmpeg will fail to encode and this
+                                 # silently falls back to the uncompressed frame for that crop rather than
+                                 # crashing the run (verified).
+      prob: 0.15
+      crf_range: [28, 40]       # lower = higher quality/bitrate
+      fps: 24
+      ffmpeg_path: ffmpeg       # must be resolvable on PATH; silently no-ops (writes uncompressed) if not
+                                 # found, or if the encode/decode round-trip doesn't preserve frame count
+
+  # Group-level settings for the mutually-exclusive augmentation groups
+  # defined under `types` above -- see augmentation.py's
+  # decide_mutually_exclusive_group and "TONE / EXPOSURE MUTUAL EXCLUSION"
+  # docstring section. Currently there's just the one group.
+  groups:
+    tone_exposure:
+      prob: 0.6   # chance that ANY ONE of exposure_adjustment / white_balance_shift /
+                  # gamma_correction / color_jitter fires on a given crop instance at all.
+                  # Below this roll, none of the four fire, same as any other missed type.
+                  # If it fires, exactly one of the four is picked, weighted by that type's
+                  # own `prob` above relative to the other enabled members of the group.
+
+  # Decide WHICH raw frames a crop is built from and in what order -- see
+  # augmentation.py's "TEMPORAL AUGMENTATIONS" docstring section. Decided
+  # once per crop instance, shared by every duplicate of that crop.
+  temporal:
+    reverse:
+      enabled: true
+      prob: 0.15                 # crop's frames used in reverse order; output still written under the
+                                 # original frame_filenames names
+    variable_interval:
+      enabled: true              # ON. Independent of `reverse` above -- both are decided separately per
+                                 # crop and compose fine (a crop can be both reversed AND strided). Only
+                                 # actually engages on scenes that have extra frames on disk beyond
+                                 # frame_filenames matching frame_pattern; everywhere else it silently
+                                 # falls back to the default consecutive frames (confirmed, not a failure).
+      prob: 0.1
+      frame_pattern: "frame{idx}.jpg"   # "{idx}"-templated -- must match your actual on-disk naming
+      max_available_frames: 15  # highest idx to probe for on disk beyond frame_filenames
+      stride_choices: [1, 2, 3] # tries strides in random order per crop, falls back to default frames
+                                 # if no stride yields a valid run of consecutive-by-stride frames
+
+  # A crop instance can be duplicated into extra output copies, each with
+  # its own independently-drawn (and checked-unique) crop-local augmentation
+  # combo -- see augmentation.py's "CROP DUPLICATION" docstring section.
+  # Duplicates still all share the same scene-level lens/optics draw as
+  # their parent crop (tier 1 above never varies within a scene); only the
+  # tone/exposure group pick (tier 2) and the independent tier-3 types vary
+  # from one duplicate to the next.
+  duplication:
+    enabled: true                # ON. Orthogonal to everything above -- it just makes extra copies of a
+                                 # crop, each drawing its own independent (and checked-unique) crop-local
+                                 # augmentation combo from the same `types`/`groups` blocks, so it doesn't
+                                 # change what's "safe" to combine, only how many differently-augmented
+                                 # versions of a crop you get.
+    prob: 0.15                   # per-crop probability of being duplicated at all
+    max_total_instances: 3      # upper bound on copies (including the original); actual count per
+                                 # triggered crop is randomized between 2 and this value
+    max_redraw_attempts: 20     # redraw attempts to force each duplicate's crop-local augmentation-type
+                                 # combo to differ from its siblings before giving up and accepting a
+                                 # collision (scene-fixed lens/optics types are excluded from this
+                                 # uniqueness check -- see decide_unique_augmentations)
