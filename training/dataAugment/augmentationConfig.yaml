@@ -56,7 +56,7 @@ augmentation:
     # tier 3: independent per folder
     flip_h:
       enabled: true
-      prob: 0.5
+      prob: 0.4
     flip_v:
       enabled: false
       prob: 0.3
@@ -75,20 +75,20 @@ augmentation:
     # crop index and every sequence-length variant descending from the
     # same source scene reuses this identical draw.
     lens_distortion:
-      enabled: true
+      enabled: false
       prob: 0.15
-      k1_range: [-0.15, 0.15]   # radial distortion coeff (barrel < 0 < pincushion). Keep modest --
+      k1_range: [-0.05, 0.05]   # radial distortion coeff (barrel < 0 < pincushion). Keep modest --
                                  # larger values need pixels beyond the crop's own box, which fall
                                  # back to edge-reflection rather than true neighboring content.
-      k2_range: [-0.05, 0.05]
+      k2_range: [-0.02, 0.02]
     chromatic_aberration:
-      enabled: true
+      enabled: false
       prob: 0.15
-      shift_range: [0.0, 0.006] # fractional radial shift; R and B pushed in opposite directions
+      shift_range: [0.00, 0.002] # fractional radial shift; R and B pushed in opposite directions
     vignetting:
       enabled: true
       prob: 0.2
-      strength_range: [0.15, 0.45]
+      strength_range: [0.05, 0.2]
       falloff: 2.2
 
     # --- sensor/ISP + tone/color grading -- TIER 2: MUTUALLY EXCLUSIVE GROUP ---
@@ -99,34 +99,34 @@ augmentation:
     exposure_adjustment:
       enabled: true
       prob: 0.15
-      stops_range: [-0.5, 0.5]
+      stops_range: [-0.2, 0.2]
     white_balance_shift:
       enabled: true
       prob: 0.15
-      gain_range: [0.85, 1.15]
+      gain_range: [0.95, 1.05]
     gamma_correction:
       enabled: true
       prob: 0.2
-      gamma_range: [0.7, 1.3]
+      gamma_range: [0.9, 1.1]
     color_jitter:
       enabled: true
       prob: 0.3
-      brightness: 0.2
-      contrast: 0.2
-      saturation: 0.2
-      hue: 0.05
+      brightness: 0.1
+      contrast: 0.1
+      saturation: 0.1
+      hue: 0.02
 
     # --- optical blur ---
     # tier 3: independent per folder
     gaussian_blur:
       enabled: true
       prob: 0.15
-      kernel_range: [3, 7]
+      kernel_range: [3, 5]
       sigma_range: [0, 0]
     defocus_blur:
       enabled: true
       prob: 0.15
-      radius_range: [2, 6]
+      radius_range: [1, 3]
     motion_blur:
       enabled: false
       prob: 0.15
@@ -137,7 +137,7 @@ augmentation:
     gaussian_noise:
       enabled: true
       prob: 0.15
-      std_range: [3, 15]
+      std_range: [2, 6]
 
     # --- occlusion ---
     random_erasing:
