@@ -67,8 +67,8 @@ curriculum:
   # max_long_side) whose threshold is >= the sample's long edge wins.
   phase_buckets:
     - {max_long_side: 1000,  phase: 1}
-    - {max_long_side: 1920,  phase: 2}
-    - {max_long_side: 2560,  phase: 3}
+    - {max_long_side: 1280,  phase: 2}
+    - {max_long_side: 1536,  phase: 3}
     - {max_long_side: .inf,  phase: 4}
 
 # Dynamic batch_size / accum_steps by resolution, looked up the same way
@@ -82,11 +82,13 @@ curriculum:
 # never invents its own resolution->batch_size mapping.
 dynamic_batch:
   thresholds:
-  - {max_long_side: 640,  batch_size: 10, accum_steps: 1}
-  - {max_long_side: 1280, batch_size: 5,  accum_steps: 2}
-  - {max_long_side: 1920, batch_size: 3,  accum_steps: 4}
-  - {max_long_side: 2560, batch_size: 2,  accum_steps: 5}
-  - {max_long_side: 3840, batch_size: 1,  accum_steps: 10}
+  - {max_long_side: 128,  batch_size: 64, accum_steps: 1}
+  - {max_long_side: 256,  batch_size: 16, accum_steps: 4}
+  - {max_long_side: 320,  batch_size: 8,  accum_steps: 8}
+  - {max_long_side: 426,  batch_size: 8,  accum_steps: 8}
+  - {max_long_side: 640 , batch_size: 4,  accum_steps: 16}
+  - {max_long_side: 720,  batch_size: 2,  accum_steps: 32}
+  - {max_long_side: 1280, batch_size: 1,  accum_steps: 64}
   - {max_long_side: .inf, batch_size: 1,  accum_steps: 10}
 
 # Flow-estimation train_scale, smoothly interpolated (piecewise-linear)
