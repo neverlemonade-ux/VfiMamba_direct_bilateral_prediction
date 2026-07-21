@@ -1,6 +1,6 @@
 """
 cropping.py -- scene cropping + motion filtering + progressive
-sequence-length variant generation for the VFIMamba fine-tune pipeline.
+sequence-window variant generation for the VFIMamba fine-tune pipeline.
 
 This is STAGE 1 of a two-stage preprocessing pipeline (this script, then
 augmentation.py). The jobs are now split like this:
@@ -9,7 +9,8 @@ augmentation.py). The jobs are now split like this:
                         example. Dynamic multi-crop placement, a motion
                         gate (reject crops that are just static sky/wall/
                         background), and generation of a family of
-                        progressively shorter clips from each crop.
+                        progressively narrower frame-windows from each
+                        crop, swept three different ways.
     augmentation.py    : HOW those pixels look. Photometric/blur/noise/
                         compression augmentation, run as a SEPARATE pass
                         over whatever this script writes.
@@ -74,34 +75,49 @@ attempt clears the bar, the crop slot is either skipped entirely
 with a logged warning (false) -- never silently written without a
 review trail either way.
 
-=== SEQUENCE-LENGTH VARIANTS -- WHAT AND WHY ===
+=== SEQUENCE-WINDOW VARIANTS -- WHAT AND WHY ===
 Once a crop box passes the motion gate, ALL of the scene's frames are
 cropped through it exactly once (cheap: one crop pass, not one per
-variant). That single cropped frame list is then written out as several
-training examples of DECREASING length, all anchored at frame 1:
+variant). That single cropped frame list is then sliced into several
+training examples of progressively NARROWER frame-index windows.
 
-    variant 0: frames 1..N            (the full-length crop)
-    variant 1: frames 1..floor(0.9*N) (drop the last ~10%)
-    variant 2: frames 1..floor(0.9*that)
-    ...
+Earlier versions of this script anchored every shorter variant at
+frame 0 and only trimmed off the end. That's a poor fit for how the
+model actually trains: sampling is done between random MIDDLE frames of
+whatever window survives, so anchoring everything at frame 0 barely
+moves the sampled middle region between variants -- you get shorter
+clips, not more diverse ones.
 
-i.e. each variant keeps the FRONT of the sequence and drops frames off
-the END, and each new length is ~90% of the previous variant's length
-(not 90% of the original N) -- so a 100-frame scene yields lengths
-100, 90, 81, 72, 64, ... The reduction keeps going only as long as the
-last variant actually written still has at least
-sequence.min_frames_to_continue frames (default 5); once continuing
-would produce something shorter than sequence.min_output_frames
-(default 3), generation for that crop stops. See
-compute_sequence_lengths for the exact loop -- the effective shortest
-variant you end up with therefore depends on N and isn't a fixed number,
-it just won't go below min_output_frames or continue past a variant
-shorter than min_frames_to_continue.
+Instead, compute_sequence_windows() trims frames off BOTH ends of the
+window every step, with the trim fraction growing step over step
+(sequence.reduction_pct at step 0, accelerating by sequence.accel_rate
+each subsequent step -- slow at first, faster later). On top of that,
+THREE independent sweep schedules are run per crop, differing only in
+how the per-step trim is split between the two ends, and how that split
+drifts as the window shrinks:
 
-This gives the model training examples across a whole range of
-effective "playback speeds"/durations from the same underlying motion,
-without re-deciding the crop position or re-running the motion gate for
-each one.
+    symmetric     : always splits every step's trim ~50/50 between
+                    head and tail.
+    front_to_back : starts front-heavy (most of the trim comes off the
+                    start) and drifts to back-heavy (most comes off the
+                    end) as the window narrows.
+    back_to_front : the mirror image -- starts back-heavy, drifts to
+                    front-heavy.
+
+All three schedules start from the same full-length window, so that one
+shared window is written once (not three times) and every window after
+it is tagged with which schedule produced it. Because the three
+schedules diverge in different directions, they land on different
+frame-index windows of the same length at the same step -- i.e. the
+"middle" content actually differs between them, which is the point:
+more unique training examples out of the same crop, not just more
+copies of the same shrink.
+
+See compute_sequence_windows for the exact per-step math -- the
+effective narrowest window you end up with depends on total_frames and
+isn't a fixed number; it just won't go narrower than
+sequence.min_output_frames or continue past a window already narrower
+than sequence.min_frames_to_continue.
 
 === OUTPUT LAYOUT / NAMING ===
 Output scenes are written under data.output_root (default
@@ -109,25 +125,34 @@ Output scenes are written under data.output_root (default
 it -- where <size> is the single active crop.crop_size for this run,
 e.g. "train_10k_cropped_128" or "train_10k_cropped_320x240"; this keeps
 size-ladder runs against the same input_root from colliding by default
-even before a per-scene crop index is appended). Crop-position naming
-matches the original combined script: a scene yielding exactly one crop
-is named "<scene>_<size>"; one yielding N>1 crops is named
-"<scene>_<size>_00", "..._01", .... Every scene, per this task's
-requirement, ALSO carries its frame count in the folder name: an
-"_f<NNN>" suffix is appended (zero-padded to the digit-width of the
-scene's own full frame count, so e.g. a 100-frame scene's variants sort
-as ..._f100, ..._f090, ..._f081, ...) -- a separate size string (e.g.
-"128", "320x240") is already part of the base name before that suffix,
-so different crop_sizes never collide. Each output folder keeps the
-same frame filenames (and extensions) as the source (000000.png,
-000001.png, ...) -- just fewer of them for the shorter variants; nothing
-is renumbered.
+even before a per-scene crop index is appended). If data.output_root IS
+explicitly set in config, that path is treated as "whatever folder is
+pointed at" and a subfolder named "<dataset_name>_cropped_<size>" is
+created INSIDE it -- scenes are never dumped directly into an
+explicitly-pointed-at folder.
+
+Crop-position naming matches the original combined script: a scene
+yielding exactly one crop is named "<scene>_<size>"; one yielding N>1
+crops is named "<scene>_<size>_00", "..._01", .... Every output scene
+folder additionally carries its frame window and (if not the shared
+full-length window) which sweep schedule produced it:
+
+    "<base_name>_s<start>_f<length>"            (shared full window)
+    "<base_name>_s<start>_f<length>_sym"        (symmetric sweep)
+    "<base_name>_s<start>_f<length>_f2b"        (front_to_back sweep)
+    "<base_name>_s<start>_f<length>_b2f"        (back_to_front sweep)
+
+start/length are zero-padded to the digit-width of the scene's own full
+frame count, so all of one scene's variants sort/line up together. Each
+output folder keeps the same frame filenames (and extensions) as the
+source (000000.png, 000001.png, ...) for whichever slice of indices
+[start:start+length) it covers -- nothing is renumbered.
 
 A manifest.jsonl is written to output_root recording, per output folder:
-source scene, crop box, source resolution, full-scene frame count, this
-variant's frame count, motion score, and reroll attempts used -- the
-same "durable, browsable record" convention as the rest of this
-pipeline.
+source scene, crop box, source resolution, full-scene frame count,
+sweep schedule, window start/end, this variant's frame count, motion
+score, and reroll attempts used -- the same "durable, browsable record"
+convention as the rest of this pipeline.
 
 === ASSUMPTIONS WORTH KNOWING ABOUT ===
 - Frame numbering is contiguous from data.frame_index_start (see INPUT
@@ -139,12 +164,19 @@ pipeline.
 - Only one crop size is active per run (see ONE CROP SIZE PER RUN
   above); run the script again with a different crop.crop_size (and the
   same output_root) to build out a size ladder.
-- The "~10%" reduction is `floor(current * (1 - sequence.reduction_pct))`
-  applied to the PREVIOUS variant's length, not the original count --
-  this matches "100, 90, 81, ..." rather than "100, 90, 80, ...".
+- The per-step trim fraction is `reduction_pct * (1 + accel_rate) **
+  step`, applied to the CURRENT window's length at that step -- each
+  step trims a bigger percentage than the last, not a constant amount.
+- The head/tail split of each step's trim is 50/50 for the symmetric
+  sweep, and drifts linearly (by window-shrink progress) between 85/15
+  and 15/85 for the two directional sweeps -- see compute_sequence_windows.
+- Windows produced by different sweep schedules that happen to land on
+  the exact same (start, end) pair (most commonly the shared full-length
+  window, but rarely also possible deeper in the chains) are written
+  only once; duplicates are silently deduped, not logged individually.
 - The motion gate looks at the WHOLE scene (sampled), not just the
-  variant being written -- a crop is a good/bad motion candidate at the
-  crop-box level, independent of which length variant you're looking at.
+  window being written -- a crop is a good/bad motion candidate at the
+  crop-box level, independent of which window variant you're looking at.
 """
 import argparse
 import math
@@ -358,32 +390,97 @@ def find_motion_passing_box(frames, w, h, crop_w, crop_h, initial_box,
 
 
 # ============================================================
-# 5. SEQUENCE-LENGTH VARIANTS
-#    See module docstring "SEQUENCE-LENGTH VARIANTS -- WHAT AND WHY".
+# 5. SEQUENCE-WINDOW VARIANTS
+#    See module docstring "SEQUENCE-WINDOW VARIANTS -- WHAT AND WHY".
 # ============================================================
 
-def compute_sequence_lengths(total_frames, reduction_pct=0.10,
+def compute_sequence_windows(total_frames, reduction_pct=0.05, accel_rate=0.5,
+                              head_bias_start=0.5, head_bias_end=0.5,
                               min_frames_to_continue=5, min_output_frames=3):
     """
-    Returns a strictly-decreasing list of frame counts starting at
-    total_frames: [N, floor(0.9*N), floor(0.9*that), ...]. Keeps
-    reducing only while the LAST length actually produced is still
-    >= min_frames_to_continue; stops before appending anything shorter
-    than min_output_frames. Guarantees strict decrease even in
-    edge-case rounding (e.g. very small `current`) by falling back to
-    `current - 1`.
+    Returns a list of (start, end) windows, starting with the full scene
+    (0, total_frames). Each step trims a percentage of the CURRENT
+    window off both ends -- that percentage grows step over step:
+
+        step_pct    = reduction_pct * (1 + accel_rate) ** step
+        trim_amount = round(current_len * step_pct)
+
+    i.e. step 0 trims reduction_pct itself (small, slow start), step 1
+    trims a bigger fraction, step 2 bigger still, etc. -- slow at
+    first, accelerating deeper into the chain.
+
+    The trim is then split between head and tail according to
+    `head_bias`, which interpolates linearly from head_bias_start to
+    head_bias_end as the window shrinks (progress = 1 -
+    current_len/total_frames, so progress=0 on the very first trim and
+    -> 1 as the window gets very narrow):
+
+        head_bias = head_bias_start + (head_bias_end - head_bias_start) * progress
+        head_trim = round(trim_amount * head_bias)
+        tail_trim = trim_amount - head_trim
+
+    head_bias_start=head_bias_end=0.5 -> symmetric split the whole way
+    through ("symmetric" sweep). head_bias_start=0.85, end=0.15 ->
+    starts front-heavy, drifts to back-heavy ("front_to_back" sweep).
+    head_bias_start=0.15, end=0.85 -> the mirror ("back_to_front").
+
+    Stops once continuing would produce something narrower than
+    min_output_frames, or once the last window written is already
+    narrower than min_frames_to_continue. Guarantees strict shrink per
+    step (falls back to a minimum 1-frame trim per side) to avoid
+    stalling on rounding.
     """
-    lengths = [total_frames]
-    current = total_frames
-    while current >= min_frames_to_continue:
-        nxt = math.floor(current * (1.0 - reduction_pct))
-        if nxt >= current:
-            nxt = current - 1
-        if nxt < min_output_frames:
+    start, end = 0, total_frames
+    windows = [(start, end)]
+    current_len = total_frames
+    step = 0
+
+    while current_len >= min_frames_to_continue:
+        step_pct = reduction_pct * ((1.0 + accel_rate) ** step)
+        trim_amount = int(round(current_len * step_pct))
+        if trim_amount < 1:
+            trim_amount = 1
+
+        progress = 1.0 - (current_len / total_frames)
+        head_bias = head_bias_start + (head_bias_end - head_bias_start) * progress
+        head_bias = min(max(head_bias, 0.0), 1.0)
+
+        head_trim = int(round(trim_amount * head_bias))
+        tail_trim = trim_amount - head_trim
+
+        new_start = start + head_trim
+        new_end = end - tail_trim
+        new_len = new_end - new_start
+
+        if new_len >= current_len:
+            # rounding stalled progress -- force minimal trim on both sides
+            new_start = start + 1
+            new_end = end - 1
+            new_len = new_end - new_start
+
+        if new_len < min_output_frames or new_start >= new_end:
             break
-        lengths.append(nxt)
-        current = nxt
-    return lengths
+
+        windows.append((new_start, new_end))
+        start, end = new_start, new_end
+        current_len = new_len
+        step += 1
+
+    return windows
+
+
+# The three sweep schedules run per crop -- see compute_sequence_windows
+# docstring for what each bias pair does.
+SWEEP_SCHEDULES = {
+    'symmetric':     {'head_bias_start': 0.5,  'head_bias_end': 0.5},
+    'front_to_back': {'head_bias_start': 0.85, 'head_bias_end': 0.15},
+    'back_to_front': {'head_bias_start': 0.15, 'head_bias_end': 0.85},
+}
+SWEEP_TAGS = {
+    'symmetric': 'sym',
+    'front_to_back': 'f2b',
+    'back_to_front': 'b2f',
+}
 
 
 # ============================================================
@@ -401,13 +498,18 @@ def crop_base_name(scene_name, crop_w, crop_h, crop_idx, num_crops):
     return f'{scene_name}_{size}_{crop_idx:02d}'
 
 
-def variant_output_name(base_name, length, total_frames):
-    """Appends the frame-count suffix required for every output scene
-    folder -- zero-padded to the digit-width of the scene's FULL frame
-    count so all of one scene's variants line up/sort together
-    (f100, f090, f081, ... rather than f100, f90, f81, ...)."""
+def variant_output_name(base_name, start, length, total_frames, sweep_tag=None):
+    """Appends start-offset, frame-count, and (if given) sweep-schedule
+    tag -- start/length zero-padded to the digit-width of the scene's
+    FULL frame count so variants sort/line up together. sweep_tag
+    disambiguates which of the 3 shrink schedules produced this
+    particular window (omitted for the one shared full-length window
+    all schedules start from, since that's written only once)."""
     width = len(str(total_frames))
-    return f'{base_name}_f{length:0{width}d}'
+    name = f'{base_name}_s{start:0{width}d}_f{length:0{width}d}'
+    if sweep_tag:
+        name += f'_{sweep_tag}'
+    return name
 
 
 # ============================================================
@@ -420,9 +522,10 @@ def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
     """
     Crops one source scene (0..num_crops crop boxes at the single
     configured crop size, each motion-gated) and, for every box that
-    passes, writes the full-length crop plus every shorter
-    sequence-length variant computed by compute_sequence_lengths.
-    Returns a list of manifest entries.
+    passes, writes the shared full-length window plus every narrower
+    window variant produced by the three sweep schedules in
+    compute_sequence_windows (see module docstring). Returns a list of
+    manifest entries.
     """
     index_start = data_cfg.get('frame_index_start', 0)
     digits = data_cfg.get('frame_index_digits', 6)
@@ -454,11 +557,31 @@ def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
             f'{crop_w}x{crop_h} in at least one dimension')
         return []
 
-    lengths = compute_sequence_lengths(
-        total_frames,
-        reduction_pct=seq_cfg.get('reduction_pct', 0.10),
-        min_frames_to_continue=seq_cfg.get('min_frames_to_continue', 5),
-        min_output_frames=seq_cfg.get('min_output_frames', 3))
+    # Run all configured sweep schedules and merge, deduping any window
+    # (start, end) pair produced by more than one schedule -- mainly the
+    # shared full-length window every schedule starts from, but rarely
+    # also possible deeper in the chains (see module docstring
+    # "ASSUMPTIONS WORTH KNOWING ABOUT").
+    sweep_names = seq_cfg.get('sweeps', ['symmetric', 'front_to_back', 'back_to_front'])
+    all_variants = []      # (sweep_tag_or_None, start, end)
+    seen = set()
+    for sweep_name in sweep_names:
+        bias_cfg = SWEEP_SCHEDULES[sweep_name]
+        windows = compute_sequence_windows(
+            total_frames,
+            reduction_pct=seq_cfg.get('reduction_pct', 0.05),
+            accel_rate=seq_cfg.get('accel_rate', 0.5),
+            min_frames_to_continue=seq_cfg.get('min_frames_to_continue', 5),
+            min_output_frames=seq_cfg.get('min_output_frames', 3),
+            **bias_cfg)
+        for (wstart, wend) in windows:
+            key = (wstart, wend)
+            if key in seen:
+                continue   # already produced by an earlier schedule
+                            # (the shared full-scene window, mainly)
+            seen.add(key)
+            tag = None if key == (0, total_frames) else SWEEP_TAGS[sweep_name]
+            all_variants.append((tag, wstart, wend))
 
     rng = _scene_rng(seed, scene_index, crop_w, crop_h)
     boxes = compute_crop_boxes(w, h, crop_w, crop_h, num_crops, jitter, rng)
@@ -481,12 +604,13 @@ def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
         x, y = box
         base_name = crop_base_name(scene_name, crop_w, crop_h, idx, num_crops)
 
-        # Crop every frame through this box exactly ONCE; every length
+        # Crop every frame through this box exactly ONCE; every window
         # variant below is a slice of this single cropped list.
         cropped = [f[y:y + crop_h, x:x + crop_w] for f in frames]
 
-        for length in lengths:
-            out_name = variant_output_name(base_name, length, total_frames)
+        for (tag, wstart, wend) in all_variants:
+            length = wend - wstart
+            out_name = variant_output_name(base_name, wstart, length, total_frames, sweep_tag=tag)
             out_dir = os.path.join(output_root, out_name)
 
             if os.path.exists(out_dir) and not overwrite:
@@ -494,12 +618,13 @@ def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
                 continue
 
             os.makedirs(out_dir, exist_ok=True)
-            for fname, img in zip(filenames[:length], cropped[:length]):
+            for fname, img in zip(filenames[wstart:wend], cropped[wstart:wend]):
                 cv2.imwrite(os.path.join(out_dir, fname), img)
 
             motion_note = '' if motion_score is None else f' motion={motion_score:.2f}'
             reroll_note = '' if reroll_attempts == 0 else f' (rerolled x{reroll_attempts})'
             log(f'    {out_name}: crop=({x},{y},{crop_w},{crop_h}) '
+                f'window=[{wstart}:{wend}] sweep={tag or "full"} '
                 f'frames={length}/{total_frames}{motion_note}{reroll_note}')
 
             manifest_entries.append({
@@ -511,6 +636,9 @@ def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
                 'crop_box': {'x': x, 'y': y, 'w': crop_w, 'h': crop_h},
                 'source_resolution': {'w': w, 'h': h},
                 'source_total_frames': total_frames,
+                'sweep_schedule': tag or 'full',
+                'window_start': wstart,
+                'window_end': wend,
                 'variant_frame_count': length,
                 'motion_score': motion_score,
                 'motion_gate_passed': passed,
@@ -547,9 +675,19 @@ def crop_dataset(C, log=print):
     # Default output_root now carries the active crop size (e.g.
     # "<input_root>_cropped_128") -- see module docstring "OUTPUT LAYOUT
     # / NAMING". Needs crop_w/crop_h, so this is resolved after crop
-    # size parsing above rather than up front.
-    output_root = d_cfg.get('output_root') or (
-        f'{input_root.rstrip(os.sep)}_cropped_{_size_str(crop_w, crop_h)}')
+    # size parsing above rather than up front. If output_root IS
+    # explicitly set, treat it as "whatever folder is pointed at" and
+    # nest a dataset-named subfolder inside it rather than dumping scene
+    # variants directly there.
+    dataset_name = os.path.basename(os.path.normpath(input_root))
+    size_str = _size_str(crop_w, crop_h)
+    subfolder_name = f'{dataset_name}_cropped_{size_str}'
+
+    if d_cfg.get('output_root'):
+        output_root = os.path.join(d_cfg['output_root'], subfolder_name)
+    else:
+        output_root = f'{input_root.rstrip(os.sep)}_cropped_{size_str}'
+
     os.makedirs(output_root, exist_ok=True)
 
     scenes = sorted(
@@ -565,7 +703,9 @@ def crop_dataset(C, log=print):
     log(f'  motion_check: enabled={motion_cfg.get("enabled", True)} '
         f'min_motion_score={motion_cfg.get("min_motion_score", 4.0)} '
         f'skip_on_failure={motion_cfg.get("skip_on_failure", True)}')
-    log(f'  sequence: reduction_pct={seq_cfg.get("reduction_pct", 0.10)} '
+    log(f'  sequence: reduction_pct={seq_cfg.get("reduction_pct", 0.05)} '
+        f'accel_rate={seq_cfg.get("accel_rate", 0.5)} '
+        f'sweeps={seq_cfg.get("sweeps", ["symmetric", "front_to_back", "back_to_front"])} '
         f'min_frames_to_continue={seq_cfg.get("min_frames_to_continue", 5)} '
         f'min_output_frames={seq_cfg.get("min_output_frames", 3)}')
     log(f'  output_root={output_root}  overwrite={overwrite}')
@@ -597,7 +737,7 @@ def crop_dataset(C, log=print):
 def main():
     parser = argparse.ArgumentParser(
         description='Scene cropping + motion filtering + progressive '
-                    'sequence-length variant generation for the VFIMamba '
+                    'sequence-window variant generation for the VFIMamba '
                     'fine-tune pipeline')
     parser.add_argument('--config', required=True, type=str,
                          help='path to YAML config file')

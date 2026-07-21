@@ -88,3 +88,10 @@ sequence:
 
 seed: 1                          # governs crop placement AND motion-gate rerolls; reruns with the
                                  # same seed against the same input_root reproduce identical output
+
+sequence:
+  reduction_pct: 0.05           # trim fraction applied at step 0 (small, slow start)
+  accel_rate: 0.5               # growth multiplier per step (each step trims 1.5x the last fraction)
+  sweeps: [symmetric, front_to_back, back_to_front]   # which schedules to run per crop
+  min_frames_to_continue: 5
+  min_output_frames: 3
