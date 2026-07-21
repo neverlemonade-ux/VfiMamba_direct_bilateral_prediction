@@ -1,0 +1,31 @@
+# Per-run training hyperparameters ONLY. Everything that affects the
+# curriculum itself (seed, phase buckets, dynamic batch/accum, train_scale
+# anchors, validation mode) lives in config.yaml, shared across every run
+# so different phases/runs can never accidentally use different curriculum
+# settings than what curriculum_builder.py actually built.
+
+run:
+  run_name: phase1_run     # log + checkpoints go under runs_dir/run_name/ -- change per run
+  runs_dir: /mnt/d/vifmamba_runs
+  phase: 1                  # 1-4; overridden by --phase on the command line if given
+
+data:
+  pretrained: /mnt/c/Users/zheny/Downloads/VFIMamba.pkl   # '' or omit/null to train from scratch
+                                                            # (for Phase 2+, point this at the
+                                                            # previous phase's best/last checkpoint,
+                                                            # or pass --restore_ckpt instead)
+
+train:
+  epochs: 30
+  lr: 5.0e-5               # fine-tuning peak LR
+  min_lr: 1.0e-6
+  warmup_epochs: 1
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  amp: true
+
+eval:
+  eval_full_res_every: 5
+  eval_full_res_max_samples: null
+  save_every_epoch: true
+  log_every_steps: 10

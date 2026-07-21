@@ -1,2 +1,14 @@
 Train -                                 /home/zheny/vfimamba_env/bin/python3 -u Train.py
 Second Terminal watching GPU usage -    watch -n 1 nvidia-smi
+
+
+
+
+
+
+
+
+I am planning to build a data pipeline to do additional fine tuning on a video interpolation model. Here is what I want: 1. I want to look into a folder and look at all the datasets inside look into each dataset and get the subfolders containing the scenes(each training example containing the frames) and pull out all scene containing at least 3 frames needed for training 2. split them in a 80 and 20 split with 20 going to a validation folder the 80 goes into the next step 3 (random should be doon with seed number so it's reproducable with the same seed number). put all these training examples into 4 phases with phase 1 with resolution 1k and under phase 2 at around 2k phase 3 at 3k and phase 4 at 4k. 4. we use dynamic batching 
+so we batch the training examples like this (this is after rounding the resolution to the nearest 32 and grouping the same resolutio after this padding into the same batch): examples that is max long side 640 gets batched into a 10s with a folder batch containing all 10 tranining examples. max side 1280 gets batched into 6 1920 gets batch into 4 2560 into 2 and 3840 and further gets batched in size 1. This way each training batch folder can get fed into training with despite having differeing resolution training examples in the same training phase (change accum_steps according to batch size. EX: batch size 10 has accum_steps 1, batch size 6 has accum_steps 2 
+basically set effective batch size to around 10). 5. Move any extra incomplete batches into a folder called extra at the same level as phases. The extra incomplete batches folders name should contain number of training examples in the batch and phase the incomplete batch came from. 6. all phases should sort itself and be lower resolutio batches to higher resolution batches. then for phases 1 though 3 should seeded randomly divide 80 and 20. 20% batches gets marked and is evenly distrubted thoughout the higher phases this is to prevent forgetting. 7. dataset should look into a phase folder take out the batch folder and give the entire batch to be trained. from 
+the resolution training should be dynamic depending on resolution. 8. Training train scale = .5 at 2k .25 at 4k and at 1k or lower is at 1. time step should depend now many frames there are in between the frist and last frame the wanted predicted frame should be randomly seeded determinied to train any of the middle frames and different at different epochs(if there are only 3 frames then timestep has to be .5 to guess the exact middle frame). This way the whole process is reproducable and can the time step training is diverse

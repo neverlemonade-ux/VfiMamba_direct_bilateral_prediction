@@ -1,0 +1,100 @@
+# =============================================================================
+# Single global config for the whole curriculum pipeline
+# (curriculum_builder.py + dataset.py + train.py). One seed, one place for
+# every tunable. Edit this file, not the .py files, to retune the pipeline.
+# =============================================================================
+
+seed: 42   # THE global seed. Every random operation anywhere in the pipeline
+           # (train/val split, replay selection, replay export destination,
+           # dataset ordering, per-item timestep choice) derives its own
+           # independent-but-reproducible sub-seed from this ONE value via
+           # seeding.rng_for() -- see that file. Change this one number to
+           # get a fully different-but-reproducible pipeline realization.
+           # There is intentionally no second seed anywhere else in the repo.
+
+paths:
+  # src_dir is scanned recursively, exactly 2 levels deep:
+  #     src_dir/<Dataset>/<Scene>/<frames...>
+  # Any number of datasets, any number of scenes per dataset, any number
+  # of frames per scene are supported -- nothing here assumes a fixed
+  # folder count or uniform frame count across scenes.
+  src_dir: "D:/AllTrainingData"
+
+  # curriculum_builder.py writes two top-level folders under dataset_root:
+  #   dataset_root/TrainingData/Phase1..4/BatchNNN_<res>/<dataset>__<scene>/
+  #   dataset_root/ValidationData/<dataset>/<scene>/
+  # plus curriculum_metadata.yaml (top-level) and a phase_metadata.yaml /
+  # batch_metadata.yaml per phase/batch -- see curriculum_builder.py's
+  # module docstring for the full layout.
+  dataset_root: "D:/vifmamba/PhasesData"
+
+pad_multiple: 32
+image_extensions: [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"]
+
+data:
+data:
+  # Base frame names (NO extension). Order = temporal order.
+  # img0 = first present, img1 = last present, gt = a randomly-chosen
+  # (seeded) interior frame during training.
+  frame_names: ["frame1", "frame2", "frame3"]
+  flip_aug: false
+  val_max_interior_per_seq: 4
+
+# Tried in this order for EVERY frame_name, per scene, independently.
+# First existing extension wins -- lets different datasets under the same
+# src_dir mix formats freely (DatasetA/SceneX/frame1.png next to
+# DatasetB/SceneY/frame1.jpg both work with no extra config).
+image_extensions: [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"]
+
+val:
+  val_split: 0.2                  # ignored when use_manual_val is true
+  validation_native_mode: true
+  validation_batch_size: 1
+
+  use_manual_val: false           # true -> skip the seeded split entirely; val comes
+                                   # from manual_val_src instead of held-out src_dir scenes
+  manual_val_src: ""              # only read when use_manual_val is true. Same layout as
+                                   # paths.src_dir: manual_val_src/<Dataset>/<Scene>/frames...
+
+curriculum:
+  retain_ratio: 0.8   # fraction of a phase's OWN data that stays in that phase; the rest
+                       # (1 - retain_ratio) is exported EVENLY to every LATER phase as replay.
+                       # Phase 4 has no later phase, so it always retains 100% of its own data
+                       # regardless of this setting.
+
+  # Which phase a sequence's OWN data is assigned to, keyed by its
+  # nearest-`pad_multiple` padded long edge. First row (ascending
+  # max_long_side) whose threshold is >= the sample's long edge wins.
+  phase_buckets:
+    - {max_long_side: 1280,  phase: 1}
+    - {max_long_side: 1920,  phase: 2}
+    - {max_long_side: 2560,  phase: 3}
+    - {max_long_side: .inf,  phase: 4}
+
+# Dynamic batch_size / accum_steps by resolution, looked up the same way
+# as phase_buckets above (largest-below-or-equal wins). effective_batch =
+# batch_size * accum_steps -- see dataset.py's module docstring and
+# train.py's training loop for why these are combined into a single
+# micro-step counter instead of a real stacked physical batch.
+# curriculum_builder.py reads this SAME table (via
+# resolution.resolve_dynamic_batch_metadata) to label each batch folder
+# with its batch_size/gradient_accumulation/effective_batch_size -- it
+# never invents its own resolution->batch_size mapping.
+dynamic_batch:
+  thresholds:
+  - {max_long_side: 640,  batch_size: 10, accum_steps: 1}
+  - {max_long_side: 1280, batch_size: 5,  accum_steps: 2}
+  - {max_long_side: 1920, batch_size: 3,  accum_steps: 4}
+  - {max_long_side: 2560, batch_size: 2,  accum_steps: 5}
+  - {max_long_side: 3840, batch_size: 1,  accum_steps: 10}
+  - {max_long_side: .inf, batch_size: 1,  accum_steps: 10}
+
+# Flow-estimation train_scale, smoothly interpolated (piecewise-linear)
+# between anchors instead of stepping abruptly at bucket edges. Long
+# edges below the first anchor clamp to its scale; above the last anchor
+# clamp to its scale. Anchors must be sorted ascending by long edge.
+train_scale:
+  anchors:
+    - [1024, 1.0]
+    - [2048, 0.5]
+    - [4096, 0.25]

@@ -1,294 +1,317 @@
 """
-dataset.py -- ALL data handling for the VFIMamba full-resolution fine-tune
-lives here. train.py never touches a raw frame, a random seed, or a pixel
-of padding directly; it just calls prepare_datasets() once and gets back
-two torch Datasets that yield fully-prepared, padded-to-32
-(img0, gt, img1, timestep, scale, orig_h, orig_w) tuples ready to feed
-straight into the model. This is the one file to edit if you want to
-change how sequences are discovered, split, augmented, or preprocessed.
+dataset.py
 
-WHAT LIVES HERE, IN ORDER:
-  1. Seeding                     -- seed_everything() / worker_init_fn()
-  2. Physical train/val split    -- compute_split() / materialize_split()
-  3. Dynamic interior-frame pick -- _pick_val_interior_indices()
-  4. Resolution-aware scale      -- resolve_train_scale()
-  5. Padding to a multiple of 32 -- pad_to_multiple()
-  6. The Dataset itself          -- FullResVFIDataset
-  7. Orchestration               -- prepare_datasets(), called by train.py
+Loads ONE already-built curriculum phase folder (TrainingData/Phase1..4/,
+produced by curriculum_builder.py -- run that first) into a torch Dataset
+that yields padded (img0, gt, img1, timestep, orig_h, orig_w) tuples, with
+a random interior-frame/timestep pick per training item. Also loads
+ValidationData/, unbatched, with every interior frame of every val
+sequence enumerated once.
 
-=== WHY A PHYSICAL SPLIT INSTEAD OF AN IN-MEMORY ONE ===
-The previous version of this pipeline split DATA_ROOT into train/val
-entirely in memory, every time train.py ran, and never wrote that split to
-disk -- there was no durable record of which sequences were actually held
-out, and a separate script (split_train_val.py) had to re-implement the
-exact same seed/shuffle logic by hand to reconstruct it, with a comment
-warning that its SEED/VAL_SPLIT had to be kept manually in sync or you'd
-silently get a different split than what the model was validated on.
+NOTE ON Extra/: curriculum_builder.py writes an Extra/ folder inside each
+Phase<N>/ for undersized batches (item count below the configured
+batch_size for their resolution). This file's directory walk
+(_list_train_seq_dirs) only descends into Phase<N>/BatchNNN_<res>/ --
+Extra/ is not itself a "BatchNNN_<res>"-shaped folder inside the phase's
+own numbering (it's a container of differently-named batch folders), and
+since a plain os.listdir() scan visits every dir entry under phase_dir,
+Extra/ would otherwise be walked too. It's intentionally skipped here
+(see the _PHASE_SKIP_ENTRIES check) -- undersized batches were only ever
+a scaffolding by-product of the curriculum build, not something meant to
+be trained on directly. Every batch under Extra/ was also built from its
+own phase's data and never arrived there via replay -- curriculum_builder.py's
+split_retain_export() excludes undersized (is_extra) batches from export
+entirely, so Extra/ never contains cross-phase replay content. is_extra
+batches also never go through accumulation-window grouping in
+curriculum_builder.py (see that file's group_batches_into_accum_windows),
+so skipping Extra/ here means every batch this file ever loads is
+guaranteed to carry window_id/window_num_items in its batch_metadata.yaml.
 
-materialize_split() below now does this splitting itself, once, as part of
-prepare_datasets() -- it symlinks (default) or copies each sequence folder
-under DATA_ROOT into <run_dir>/split/train/ or <run_dir>/split/val/ (or
-wherever data.train_out / data.val_out point in the yaml). That gives you
-a browsable, per-run, on-disk record of exactly which sequences were
-trained on vs held out, with zero risk of the split logic drifting out of
-sync between two files, because there is now only one copy of it.
+=== ON-DISK LAYOUT THIS FILE EXPECTS (see curriculum_builder.py) ===
+
+  Train:  TrainingData/Phase<N>/BatchNNN_<res>/<idx>_<origin>__<dataset>__<scene>/
+  Val:    ValidationData/<dataset>/<scene>/
+
+Both are walked with a plain nested sorted() -- no randomness is
+re-derived here. For train, batch folders are already numbered in
+curriculum order and each scene folder's zero-padded index prefix is
+monotonically increasing across the whole phase, so sorting batch names
+then scene names within each reproduces the exact curriculum order
+curriculum_builder.py computed. For val, order doesn't carry curriculum
+meaning, so alphabetical (dataset, then scene) is used.
+
+=== WHY TRAIN BATCHES ARE PROCESSED ONE ITEM AT A TIME, NOT STACKED ===
+The curriculum interleaves replay from earlier (lower-resolution) phases
+throughout each phase's own (higher-resolution) progression -- so
+consecutive items on disk can be different native resolutions by design
+(batch folders group RUNS of same-resolution items, not the whole phase --
+see curriculum_builder.py's module docstring). Stacking a physical batch
+> 1 across differing resolutions would require either cropping everyone
+to a common shape (destroys full-native-resolution training, the whole
+point of this pipeline) or trusting the underlying VFIMamba Trainer.Model
+to accept a per-sample timestep TENSOR for batch > 1 -- which the given
+Trainer.py/model_oldRepo code never demonstrates (every call site in the
+original train.py passed a single scalar timestep).
+
+So this pipeline keeps DataLoader batch_size=1 (one sequence, its own
+native resolution, per physical step) and implements "dynamic batch_size"
+and "dynamic grad accumulation" together as ONE micro-step counter in
+train.py: effective_batch = batch_size(resolution) * accum_steps(resolution),
+looked up per item via resolution.resolve_dynamic_batch(). This is
+mathematically identical to true batching for gradient-accumulation
+purposes (loss is additive across samples) and makes no assumption about
+the model's batching support -- and it agrees with what curriculum_builder.py
+already wrote into each batch folder's batch_metadata.yaml, since every
+item in a batch folder shares one resolution by construction. See
+train.py's training loop.
+
+=== ACCUMULATION WINDOWS: window_id / window_num_items ===
+curriculum_builder.py's group_batches_into_accum_windows() chunks each
+resolution run into accumulation windows -- one intended window is
+usually SEVERAL consecutive batch folders of the same resolution, not
+one -- and stamps every batch in a window with a shared window_id plus
+the window's TRUE total item count (window_num_items). Both are read
+here straight out of each batch folder's batch_metadata.yaml (see
+_list_train_seq_dirs) and returned per item alongside batch_uid.
+
+batch_uid identifies which single physical BatchNNN_<res>/ folder an
+item came from and changes at every folder boundary -- including
+boundaries INSIDE one window -- so it is exposed here for
+traceability/logging only, same as before. window_id is the explicit,
+authoritative signal train.py flushes the optimizer on, and
+window_num_items is what train.py divides the accumulated loss by. Both
+full windows (exactly accum_steps(resolution) batches) and partial
+windows (a shorter trailing remainder of a resolution run, appended at
+the end of the phase's stream by curriculum_builder.py rather than
+discarded) carry these fields the same way -- train.py does not need to
+know or care which kind a given item's window is; window_num_items is
+already exact for either case. See train.py's training loop.
+
+=== SEEDING: PER-EPOCH, NOT GLOBAL-RANDOM-STATE ===
+Each training item's interior-frame/timestep choice is drawn from a
+dedicated RNG keyed on (global seed, 'timestep', current epoch, sequence
+folder) via seeding.rng_for() -- see __getitem__ and set_epoch() below.
+This makes the choice both reproducible (same seed always produces the
+same per-epoch pick for a given sequence) AND different from one epoch to
+the next (unlike drawing from Python's global `random` module, which
+worker_init_fn seeds once per worker and which would otherwise make every
+epoch repeat the same picks). train.py MUST call
+train_set.set_epoch(epoch) at the start of every epoch for this to work --
+see that file's training loop.
 """
 import os
-import random
-import shutil
+import re
 
 import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import Dataset
+import yaml
+
+import seeding
+from seeding import worker_init_fn  # noqa: F401  (re-exported for train.py's DataLoader)
+
+# curriculum_builder.py names each scene folder
+# "<idx>_<origin>__<dataset>__<scene>"; kept here in case any tooling wants
+# to parse it back apart (not required for loading -- see the two _list_*
+# helpers below, which only rely on directory nesting + sort order).
+ORDER_NAME_RE = re.compile(r'^(?P<idx>\d+)_(?P<origin>[^_]+(?:-[^_]+)?)__(?P<dataset>.+)__(?P<scene>[^_]+)$')
+
+# Non-batch entries that can appear directly under a Phase<N>/ folder and
+# must not be walked as if they were a BatchNNN_<res>/ folder of scenes.
+_PHASE_SKIP_ENTRIES = {'Extra', 'phase_metadata.yaml'}
 
 
-# ============================================================
-# 1. SEEDING
-#    Governs BOTH the train/val sequence split (compute_split) and the
-#    per-item dynamic interior-frame/timestep choice made inside
-#    FullResVFIDataset.__getitem__, since that draws from the global
-#    `random` module. Call seed_everything() once, before building the
-#    split or the datasets -- prepare_datasets() does this for you.
-# ============================================================
-
-def seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def worker_init_fn(worker_id):
-    """
-    Re-derives a per-worker seed from torch's (already-seeded) RNG, so
-    DataLoader workers' random frame/timestep choices are reproducible
-    too, not just the main process's.
-    """
-    seed = torch.initial_seed() % 2**32
-    np.random.seed(seed)
-    random.seed(seed)
-
-
-# ============================================================
-# 2. PHYSICAL TRAIN/VAL SPLIT
-# ============================================================
-
-def compute_split(data_root, seed, val_split):
-    """
-    Which sequence folders go to train vs val, given (seed, val_split).
-    Deterministic seeded shuffle, split by SEQUENCE (never by frame/item),
-    so overlapping items from one sequence can never leak across the
-    train/val boundary.
-    """
-    all_seqs = sorted(
-        d for d in os.listdir(data_root)
-        if os.path.isdir(os.path.join(data_root, d))
-    )
-    if not all_seqs:
-        raise RuntimeError(f'No subfolders found under {data_root}')
-
-    rng = random.Random(seed)
-    shuffled = all_seqs[:]
-    rng.shuffle(shuffled)
-    n_val = max(1, int(len(shuffled) * val_split))
-    val_seqs = set(shuffled[:n_val])
-
-    train_seqs = [s for s in all_seqs if s not in val_seqs]
-    val_seqs_list = [s for s in all_seqs if s in val_seqs]
-    return train_seqs, val_seqs_list
-
-
-def _place(seq_name, src_dir, dst_root, mode, log):
-    dst = os.path.join(dst_root, seq_name)
-    if os.path.exists(dst) or os.path.islink(dst):
-        return 'skipped (already exists)'
-
-    if mode == 'symlink':
-        try:
-            os.symlink(os.path.abspath(src_dir), dst, target_is_directory=True)
-            return 'linked'
-        except OSError as e:
-            # WSL symlinks onto NTFS-mounted drives (/mnt/c, /mnt/d, ...)
-            # need Windows Developer Mode enabled, or this raises
-            # "Operation not permitted" even with correct WSL permissions.
-            # Falling back to copy keeps the pipeline usable either way.
-            log(f'  symlink failed for {seq_name} ({e}) -- falling back to copy. '
-                f'Enable Windows Developer Mode to get symlinks working.')
-            shutil.copytree(src_dir, dst)
-            return 'copied (symlink fallback)'
-    else:
-        shutil.copytree(src_dir, dst)
-        return 'copied'
-
-
-def materialize_split(data_root, train_out, val_out, seed, val_split,
-                       mode='symlink', log=print):
-    """
-    Physically places each sequence folder from data_root into train_out/
-    or val_out/, so the split is a browsable, durable record instead of
-    something only ever computed in memory. Idempotent -- re-running with
-    the same settings just skips sequences that are already placed, so
-    it's safe to call this at the start of every training run.
-
-    Returns (train_out, val_out) -- the two directories FullResVFIDataset
-    should be pointed at.
-    """
-    os.makedirs(train_out, exist_ok=True)
-    os.makedirs(val_out, exist_ok=True)
-
-    train_seqs, val_seqs = compute_split(data_root, seed, val_split)
-    log(f'  data split: {len(train_seqs)} train / {len(val_seqs)} val sequence(s) '
-        f'(seed={seed}, val_split={val_split}, mode={mode})')
-
-    for seq in train_seqs:
-        result = _place(seq, os.path.join(data_root, seq), train_out, mode, log)
-        if result != 'linked':
-            log(f'    train/{seq}: {result}')
-    for seq in val_seqs:
-        result = _place(seq, os.path.join(data_root, seq), val_out, mode, log)
-        if result != 'linked':
-            log(f'    val/{seq}: {result}')
-
-    log(f'  -> {train_out} ({len(train_seqs)} sequences)')
-    log(f'  -> {val_out} ({len(val_seqs)} sequences)')
-    return train_out, val_out
-
-
-# ============================================================
-# 3. DYNAMIC INTERIOR-FRAME SELECTION (validation enumeration)
-# ============================================================
-
-def _pick_val_interior_indices(n, max_per_seq):
-    """
-    All interior frame indices (1 .. n-2) for a sequence of length n,
-    evenly subsampled down to at most max_per_seq if there would
-    otherwise be more -- keeps one very long sequence from dominating (or
-    blowing up the runtime of) validation by itself. Deterministic, so
-    val composition never changes across epochs. max_per_seq=None means
-    "use all interior frames, no cap".
-    """
-    interior = list(range(1, n - 1))
-    if max_per_seq is None or len(interior) <= max_per_seq:
-        return interior
-    idxs = np.linspace(0, len(interior) - 1, max_per_seq)
-    idxs = sorted(set(int(round(i)) for i in idxs))
-    return [interior[i] for i in idxs]
-
-
-# ============================================================
-# 4. RESOLUTION-AWARE TRAIN_SCALE
-# ============================================================
-
-def resolve_train_scale(h, w, thresholds, fallback):
-    """
-    Pick a flow-estimation scale for a sample based on its (original,
-    pre-padding) resolution. `thresholds` is a list of
-    [min_long_edge_px, scale] pairs; the first one the sample's long edge
-    (max(h, w)) meets or exceeds wins, checked largest-threshold-first
-    regardless of the order given. Falls back to `fallback` if thresholds
-    is empty (e.g. train_scale_auto disabled) or doesn't cover this
-    sample's resolution.
-    """
-    if not thresholds:
-        return fallback
-    long_edge = max(h, w)
-    for min_dim, scale in sorted(thresholds, key=lambda t: -t[0]):
-        if long_edge >= min_dim:
-            return scale
-    return fallback
-
-
-# ============================================================
-# 5. PADDING TO A MULTIPLE OF 32
-# ============================================================
-
-def pad_to_multiple(x, multiple=32):
-    """
-    x: (B, C, H, W). Pads only on the bottom/right with replicate padding,
-    so cropping the first h rows / w cols back out of the padded tensor
-    later exactly recovers the original, unpadded content.
-    """
+def pad_to_multiple(x, multiple):
+    """x: (B, C, H, W). Pads only bottom/right (replicate), so cropping
+    the first h rows / w cols back out later recovers the original."""
     _, _, h, w = x.shape
     ph = (multiple - h % multiple) % multiple
     pw = (multiple - w % multiple) % multiple
     return F.pad(x, (0, pw, 0, ph), mode='replicate'), h, w
 
 
-# ============================================================
-# 6. THE DATASET
-#    Reads from an ALREADY-SPLIT folder (produced by materialize_split
-#    above) -- one instance per train/val folder, not per DATA_ROOT+mode,
-#    so there is no split logic left to duplicate or drift.
-# ============================================================
+def _pick_val_interior_indices(n, max_per_seq):
+    interior = list(range(1, n - 1))
+    if max_per_seq is None or len(interior) <= max_per_seq:
+        return interior
+    idxs = sorted(set(int(round(i)) for i in np.linspace(0, len(interior) - 1, max_per_seq)))
+    return [interior[i] for i in idxs]
 
-class FullResVFIDataset(torch.utils.data.Dataset):
+
+def _list_train_seq_dirs(phase_dir):
+    """Walk Phase<N>/BatchNNN_<res>/<scene>/ in curriculum order.
+    Returns a list of (scene_dir, sample_id, batch_uid, window_id,
+    window_num_items) tuples.
+
+    batch_uid is the batch folder's own path -- a natural, unique
+    identifier for "which physical BatchNNN_<res>/ folder did this scene
+    come from," useful for logging/tracing an item back to its source
+    folder. Every scene sharing a batch_uid shares the same resolution by
+    construction (see curriculum_builder.py's group_into_batches), but
+    the reverse does NOT hold within one accumulation window:
+    curriculum_builder.py's group_batches_into_accum_windows() groups
+    several consecutive same-resolution batch folders into a single
+    window, so batch_uid can change multiple times WITHIN one window.
+
+    window_id and window_num_items are read straight out of this batch
+    folder's batch_metadata.yaml (written by curriculum_builder.py's
+    _tag_windows/write_phase_folder) -- window_id is the unambiguous,
+    authoritative signal train.py flushes the optimizer on; window_id is
+    guaranteed to change exactly at accumulation-window boundaries, never
+    inside one, and is present on every batch this function returns
+    (Extra/ batches, the only ones without it, are skipped below before
+    this point is reached). window_num_items is the window's true total
+    item count and is what train.py divides the accumulated loss by --
+    see that file's training loop.
     """
-    For a sequence dir with N of frame_filenames present (N >= 3):
-      - img0 = first present frame, img1 = last present frame
-      - gt   = a DYNAMICALLY CHOSEN interior frame, timestep = k / (N - 1)
-    TRAIN mode picks the interior frame at random on every __getitem__
-    call (reproducible given the same seed -- see seed_everything /
-    worker_init_fn above). A sequence dir always contributes exactly ONE
-    training item regardless of how many frames it has; a longer sequence
-    supplies more timestep variety ACROSS epochs, not more items within
-    one epoch.
-    VAL mode enumerates every interior frame of every val sequence once at
-    construction time (capped per sequence via val_max_interior_per_seq),
-    so val composition -- and therefore val_loss/PSNR comparisons across
-    epochs -- stays fixed and reproducible.
+    seq_dirs = []
+    for batch_name in sorted(os.listdir(phase_dir)):
+        if batch_name in _PHASE_SKIP_ENTRIES:
+            continue
+        batch_dir = os.path.join(phase_dir, batch_name)
+        if not os.path.isdir(batch_dir):
+            continue
 
-    __getitem__ returns frames already padded to a multiple of
-    `pad_multiple`, plus the pre-padding (orig_h, orig_w) so predictions
-    can be cropped back to the original size before computing PSNR later.
-    Padding is appended (bottom/right only), so
-    `padded_gt[:, :, :orig_h, :orig_w]` exactly recovers the unpadded gt.
+        meta_path = os.path.join(batch_dir, 'batch_metadata.yaml')
+        with open(meta_path) as f:
+            batch_meta = yaml.safe_load(f)
+
+        # Every batch folder reaching this point is a normal (non-Extra)
+        # batch, so window_id/window_num_items are always present --
+        # written unconditionally for non-extra batches by
+        # curriculum_builder.py's write_phase_folder.
+        window_id = batch_meta['window_id']
+        window_num_items = batch_meta['window_num_items']
+        sample_ids = {s['folder']: s['sample_id'] for s in batch_meta['scenes']}
+
+        for scene_name in sorted(os.listdir(batch_dir)):
+            scene_dir = os.path.join(batch_dir, scene_name)
+            if not os.path.isdir(scene_dir):
+                continue
+            sample_id = sample_ids.get(scene_name)
+            if sample_id is None:
+                raise RuntimeError(
+                    f'{scene_dir} has no matching entry in '
+                    f'{batch_dir}/batch_metadata.yaml -- was this folder written '
+                    f'by curriculum_builder.py?')
+            seq_dirs.append((scene_dir, sample_id, batch_dir, window_id, window_num_items))
+    return seq_dirs
+
+
+def _list_val_seq_dirs(val_dir):
+    """ValidationData/<dataset>/<scene>/ -- two levels below val_dir,
+    alphabetical (dataset, then scene); order doesn't carry curriculum
+    meaning for validation."""
+    seq_dirs = []
+    for dataset_name in sorted(os.listdir(val_dir)):
+        dataset_dir = os.path.join(val_dir, dataset_name)
+        if not os.path.isdir(dataset_dir):
+            continue
+        for scene_name in sorted(os.listdir(dataset_dir)):
+            scene_dir = os.path.join(dataset_dir, scene_name)
+            if os.path.isdir(scene_dir):
+                seq_dirs.append(scene_dir)
+    return seq_dirs
+
+
+class FullResVFIDataset(Dataset):
+    """
+    mode='train': reads a curriculum Phase folder (nested Batch/Scene, see
+    _list_train_seq_dirs) in curriculum order. One item per scene;
+    interior frame picked per-epoch (seeded) on every __getitem__ -- see
+    set_epoch(). Each item also carries its accumulation window's id and
+    true item count (window_id, window_num_items) -- see this module's
+    docstring.
+
+    mode='val': reads ValidationData/ (nested Dataset/Scene, see
+    _list_val_seq_dirs). Every interior frame of every sequence is
+    enumerated once at construction (capped via val_max_interior_per_seq),
+    fixed order, deterministic across epochs.
     """
 
-    def __init__(self, split_dir, mode, frame_filenames, flip_aug=False,
-                 val_max_interior_per_seq=4, pad_multiple=32,
-                 train_scale=0.5, train_scale_auto=False,
-                 train_scale_thresholds=None, log=print):
+    def __init__(self, split_dir, mode, frame_names, image_extensions, pad_multiple,
+                 seed, val_max_interior_per_seq=4, log=print):
         assert mode in ('train', 'val')
-        if len(frame_filenames) < 3:
-            raise ValueError('frame_filenames must list at least 3 frames')
-
         self.split_dir = split_dir
         self.mode = mode
-        self.flip_aug = flip_aug and mode == 'train'
+        self.frame_names = frame_names
+        self.image_extensions = image_extensions
         self.pad_multiple = pad_multiple
-        self.train_scale = train_scale
-        self.train_scale_auto = train_scale_auto
-        self.train_scale_thresholds = train_scale_thresholds or []
+        self.seed = seed
+        self.epoch = 0
 
-        seqs = sorted(
-            d for d in os.listdir(split_dir)
-            if os.path.isdir(os.path.join(split_dir, d))
-        )
+        seq_dirs = _list_train_seq_dirs(split_dir) if mode == 'train' else _list_val_seq_dirs(split_dir)
 
-        # train: one item per sequence -> (seq_dir, present_frames)
-        # val:   one item per (sequence, interior frame) -> (seq_dir, present_frames, k)
+        # Both modes resolve each frame_name -> actual on-disk filename
+        # (frame_name + whichever extension in image_extensions exists)
+        # the same way curriculum_builder.py's find_frame_file() does --
+        # frame_names in config are extension-less, so a bare
+        # os.path.exists(seq_dir / frame_name) check (no extension) would
+        # never match anything on disk.
         self.items = []
         skipped = 0
-        for seq in seqs:
-            seq_dir = os.path.join(split_dir, seq)
-            present = [f for f in frame_filenames
-                       if os.path.exists(os.path.join(seq_dir, f))]
-            if len(present) < 3:
-                skipped += 1
-                continue
-            if mode == 'train':
-                self.items.append((seq_dir, present))
-            else:
+        if mode == 'train':
+            for seq_dir, sample_id, batch_uid, window_id, window_num_items in seq_dirs:
+                present = [p for p in (
+                    self._find_frame_file(seq_dir, name, self.image_extensions)
+                    for name in self.frame_names
+                ) if p is not None]
+                if len(present) < 3:
+                    skipped += 1
+                    continue
+                self.items.append((seq_dir, present, sample_id, batch_uid, window_id, window_num_items))
+        else:
+            for seq_dir in seq_dirs:
+                present = [p for p in (
+                    self._find_frame_file(seq_dir, name, self.image_extensions)
+                    for name in self.frame_names
+                ) if p is not None]
+                if len(present) < 3:
+                    skipped += 1
+                    continue
                 n = len(present)
                 for k in _pick_val_interior_indices(n, val_max_interior_per_seq):
                     self.items.append((seq_dir, present, k))
 
         if skipped:
-            log(f'  [{mode}] {skipped} sequence dir(s) under {split_dir} had fewer '
-                f'than 3 of frame_filenames present and were skipped entirely')
-        log(f'  [{mode}] {len(seqs) - skipped} sequence(s) -> {len(self.items)} '
-            f'item(s) from {split_dir}')
+            log(f'  [{mode}] {skipped} folder(s) under {split_dir} had < 3 frames present, skipped')
+        log(f'  [{mode}] {len(self.items)} item(s) from {split_dir}')
+        if skipped and not self.items:
+            log(f'  [{mode}] WARNING: everything under {split_dir} was skipped -- check '
+                f'data.frame_names against the actual files on disk.')
+
+    @staticmethod
+    def _find_frame_file(seq_dir, frame_name, extensions):
+        """Try frame_name + each extension, in order, return the matched
+        filename (with extension) or None. Mirrors curriculum_builder.py's
+        find_frame_file so both files resolve the same scene's frames
+        identically regardless of per-dataset format."""
+        for ext in extensions:
+            candidate = os.path.join(seq_dir, f'{frame_name}{ext}')
+            if os.path.exists(candidate):
+                return f'{frame_name}{ext}'
+        return None
+
+    def set_epoch(self, epoch):
+        """Call once at the start of every training epoch (train.py's
+        training loop, before iterating train_loader). Changes the salt
+        fed into the per-item timestep RNG in __getitem__, so the
+        interior-frame/timestep pick varies deterministically from one
+        epoch to the next instead of being fixed for the whole run.
+
+        NOTE on DataLoader worker processes: this only reaches
+        already-running persistent workers if the DataLoader is recreated
+        (or persistent_workers=False, the default) each epoch -- a
+        persistent-worker pool holds a fork/pickle snapshot of this
+        Dataset object taken at first iteration and will NOT see later
+        attribute updates made in the parent process. train.py's
+        DataLoader explicitly sets persistent_workers=False for this
+        reason; if that ever changes, this method stops propagating to
+        workers silently.
+        """
+        self.epoch = epoch
 
     def __len__(self):
         return len(self.items)
@@ -298,16 +321,8 @@ class FullResVFIDataset(torch.utils.data.Dataset):
         path = os.path.join(seq_dir, filename)
         img = cv2.imread(path)
         if img is None:
-            raise FileNotFoundError(
-                f'could not read {path} -- check frame_filenames matches your '
-                f'actual data layout'
-            )
+            raise FileNotFoundError(f'could not read {path} -- check frame_names')
         return img
-
-    def _resolve_scale(self, h, w):
-        if self.train_scale_auto:
-            return resolve_train_scale(h, w, self.train_scale_thresholds, self.train_scale)
-        return self.train_scale
 
     def _to_padded_tensor(self, im):
         im = np.ascontiguousarray(im)
@@ -317,12 +332,13 @@ class FullResVFIDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         if self.mode == 'train':
-            seq_dir, present = self.items[idx]
+            seq_dir, present, sample_id, batch_uid, window_id, window_num_items = self.items[idx]
             n = len(present)
-            # n == 3 -> only one possible interior frame (index 1).
-            # n  > 3 -> pick one at random on every call, from the global
-            # `random` module (seeded -- see seed_everything()).
-            k = 1 if n == 3 else random.randint(1, n - 2)
+            if n == 3:
+                k = 1
+            else:
+                rng = seeding.rng_for(self.seed, 'timestep', self.epoch, sample_id)
+                k = rng.randint(1, n - 2)
         else:
             seq_dir, present, k = self.items[idx]
             n = len(present)
@@ -332,86 +348,52 @@ class FullResVFIDataset(torch.utils.data.Dataset):
         img1 = self._load(seq_dir, present[-1])
         timestep = k / (n - 1)
 
-        if self.flip_aug:
-            if random.random() < 0.5:  # horizontal flip
-                img0, gt, img1 = img0[:, ::-1], gt[:, ::-1], img1[:, ::-1]
-            if random.random() < 0.5:  # vertical flip
-                img0, gt, img1 = img0[::-1], gt[::-1], img1[::-1]
-            if random.random() < 0.5:  # temporal swap
-                img0, img1 = img1, img0
-                # Reverses which frame timestep is measured from -- MUST
-                # flip timestep too now that it varies, or roughly a sixth
-                # of augmented samples would silently train against the
-                # wrong target (see module docstring in the old train.py).
-                timestep = 1.0 - timestep
-
-        orig_h, orig_w = gt.shape[:2]
-        scale = self._resolve_scale(orig_h, orig_w)
-
         img0_t, h, w = self._to_padded_tensor(img0)
         gt_t, _, _ = self._to_padded_tensor(gt)
         img1_t, _, _ = self._to_padded_tensor(img1)
 
-        return (img0_t, gt_t, img1_t,
-                torch.tensor(timestep, dtype=torch.float32),
-                torch.tensor(scale, dtype=torch.float32),
-                h, w)
+        if self.mode == 'train':
+            return (img0_t, gt_t, img1_t, torch.tensor(timestep, dtype=torch.float32),
+                    h, w, batch_uid, window_id, window_num_items)
+        return (img0_t, gt_t, img1_t, torch.tensor(timestep, dtype=torch.float32), h, w)
 
 
-# ============================================================
-# 7. ORCHESTRATION -- the one thing train.py actually calls
-# ============================================================
-
-def prepare_datasets(C, run_dir, log=print):
+def prepare_datasets(cfg, phase, log=print):
     """
-    Everything train.py needs to go from a yaml config to two ready-to-use
-    Datasets: seeds every RNG, materializes the physical train/val split
-    on disk, and constructs both FullResVFIDataset instances. train.py
-    should not need to import anything else from this file for the common
-    case -- worker_init_fn is exposed separately only because DataLoader
-    needs a direct reference to it.
+    Build the train Dataset for the given phase (1-4) plus the val
+    Dataset. Both are read-only over a curriculum ALREADY BUILT by
+    curriculum_builder.py -- this function does not split or shuffle
+    anything itself; run curriculum_builder.py first.
     """
-    d_cfg = C['data']
-    r_cfg = C['run']
-    t_cfg = C['train']
+    dataset_root = cfg['paths']['dataset_root']
+    phase_dir = os.path.join(dataset_root, 'TrainingData', f'Phase{phase}')
+    val_dir = os.path.join(dataset_root, 'ValidationData')
+    if not os.path.isdir(phase_dir):
+        raise RuntimeError(
+            f'{phase_dir} does not exist -- run curriculum_builder.py first '
+            f'(it builds TrainingData/Phase1..4/ and ValidationData/ under paths.dataset_root).')
+    if not os.path.isdir(val_dir):
+        raise RuntimeError(f'{val_dir} does not exist -- run curriculum_builder.py first.')
 
-    seed = r_cfg.get('seed', 42)
-    seed_everything(seed)
+    d_cfg = cfg['data']
+    image_extensions = cfg['image_extensions']
+    pad_multiple = cfg['pad_multiple']
+    seed = cfg['seed']
 
-    data_root = d_cfg['data_root']
-    val_split = d_cfg.get('val_split', 0.2)
-    split_mode = d_cfg.get('split_mode', 'symlink')
-    train_out = d_cfg.get('train_out') or os.path.join(run_dir, 'split', 'train')
-    val_out = d_cfg.get('val_out') or os.path.join(run_dir, 'split', 'val')
+    train_set = FullResVFIDataset(
+        phase_dir, 'train', d_cfg['frame_names'], image_extensions, pad_multiple,
+        seed=seed, log=log)
 
-    materialize_split(data_root, train_out, val_out, seed, val_split,
-                       mode=split_mode, log=log)
+    val_set = FullResVFIDataset(
+        val_dir, 'val', d_cfg['frame_names'], image_extensions, pad_multiple,
+        seed=seed, val_max_interior_per_seq=d_cfg.get('val_max_interior_per_seq', 4), log=log)
 
-    frame_filenames = tuple(d_cfg['frame_filenames'])
-    flip_aug = d_cfg.get('flip_aug', False)
-    val_max_interior = d_cfg.get('val_max_interior_per_seq', 4)
+    if len(train_set) == 0:
+        raise RuntimeError(
+            f'{phase_dir} produced 0 usable train items -- check data.frame_names '
+            f'against the actual files on disk, and that curriculum_builder.py ran '
+            f'successfully for this phase.')
+    if len(val_set) == 0:
+        log('  WARNING: val set has 0 items -- val_loss/PSNR will be meaningless this run.')
 
-    pad_multiple = t_cfg.get('pad_multiple', 32)
-    train_scale = t_cfg.get('train_scale', 0.5)
-    ts_auto_cfg = t_cfg.get('train_scale_auto') or {}
-    train_scale_auto = ts_auto_cfg.get('enabled', False)
-    train_scale_thresholds = ts_auto_cfg.get('thresholds') or []
-    if train_scale_auto and not train_scale_thresholds:
-        raise ValueError(
-            'train.train_scale_auto.enabled is true but no thresholds were '
-            'given -- set train.train_scale_auto.thresholds, or disable '
-            'train_scale_auto and rely on the flat train.train_scale instead')
-
-    common_kwargs = dict(
-        frame_filenames=frame_filenames,
-        val_max_interior_per_seq=val_max_interior,
-        pad_multiple=pad_multiple,
-        train_scale=train_scale,
-        train_scale_auto=train_scale_auto,
-        train_scale_thresholds=train_scale_thresholds,
-        log=log,
-    )
-    train_set = FullResVFIDataset(train_out, 'train', flip_aug=flip_aug, **common_kwargs)
-    val_set = FullResVFIDataset(val_out, 'val', flip_aug=False, **common_kwargs)
-
-    return train_set, val_set
+    return train_set, val_set 
