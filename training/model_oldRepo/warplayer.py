@@ -3,6 +3,11 @@ import torch
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 backwarp_tenGrid = {}
 
+from collections import OrderedDict
+
+backwarp_tenGrid = OrderedDict()
+MAX_CACHE_ENTRIES = 12  # tune to taste; see note below
+
 def warp(tenInput, tenFlow):
     k = (str(tenFlow.device), str(tenFlow.size()))
     if k not in backwarp_tenGrid:
@@ -12,6 +17,11 @@ def warp(tenInput, tenFlow):
             1, 1, tenFlow.shape[2], 1).expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
         backwarp_tenGrid[k] = torch.cat(
             [tenHorizontal, tenVertical], 1).to(device)
+        backwarp_tenGrid.move_to_end(k)
+        if len(backwarp_tenGrid) > MAX_CACHE_ENTRIES:
+            backwarp_tenGrid.popitem(last=False)  # evict least-recently-used
+    else:
+        backwarp_tenGrid.move_to_end(k)  # mark as recently used
 
     tenFlow = torch.cat([tenFlow[:, 0:1, :, :] / ((tenInput.shape[3] - 1.0) / 2.0),
                          tenFlow[:, 1:2, :, :] / ((tenInput.shape[2] - 1.0) / 2.0)], 1)

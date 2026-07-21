@@ -71,6 +71,7 @@ class Model:
         '''
         Infer with down_scale flow
         Noting: return BxCxHxW
+        `timestep` may be any value in (0, 1) -- not restricted to 0.5.
         '''
         def infer(imgs):
             img0, img1 = imgs[:, :3], imgs[:, 3:6]
@@ -102,6 +103,7 @@ class Model:
         imgs = torch.cat((img0, img1), 1)
         '''
         Noting: return BxCxHxW
+        `timestep` may be any value in (0, 1) -- not restricted to 0.5.
         '''
         if fast_TTA:
             imgs_ = imgs.flip(2).flip(3)
@@ -115,3 +117,20 @@ class Model:
         else:
             _, _, _, pred2 = self.net(imgs.flip(2).flip(3), timestep=timestep, scale=scale, local=local)
             return (pred + pred2.flip(2).flip(3)) / 2
+
+    @torch.no_grad()
+    def inference_multi_t(self, img0, img1, local, timesteps, scale=0):
+        '''
+        Interpolate at an arbitrary LIST of intermediate timesteps (any
+        values in (0, 1), in any order/spacing -- e.g. slow-motion Nx
+        interpolation, or a handful of specific frame positions) in one
+        pass. The expensive backbone (and, for AccelFlow, the
+        acceleration head) runs exactly ONCE for the pair, regardless of
+        how many timesteps are requested -- see
+        MultiScaleFlow.forward_multi_t / AccelFlow.forward_multi_t.
+
+        Returns: list of BxCxHxW predictions, one per entry in
+        `timesteps`, in the same order.
+        '''
+        imgs = torch.cat((img0, img1), 1)
+        return self.net.forward_multi_t(imgs, timesteps, local=local, scale=scale)

@@ -75,6 +75,21 @@ with its just-updated self.epoch -- at the start of every epoch's
 iteration. If persistent_workers were ever turned on, already-running
 workers would keep the Dataset snapshot from the FIRST epoch and never
 see later set_epoch() calls, silently breaking per-epoch variation.
+
+=== ACCEL LOSS AND `local` CONSISTENCY ===
+When model.net has an accel_head (AccelFlow), accel_distillation_loss is
+called with local=local (the SAME local-refinement flag used for this
+step's main forward pass), not a hardcoded value. accel_head is a single
+shared module: it's called once inside the main forward (on a D that went
+through local refinement whenever `local` is truthy) and once more inside
+accel_distillation_loss (on its own separately-computed D). If those two
+calls used different `local` settings, accel_head would be trained
+against a different input distribution than the one it actually sees at
+inference -- passing the same `local` through keeps them consistent. The
+accel loss's TEACHER pass (real flow to the real middle frame) always
+uses full local refinement internally regardless, since it's a no_grad
+target computation and a better-refined target is strictly better
+supervision.
 """
 import argparse
 import math
@@ -199,6 +214,7 @@ def main(cfg, run_cfg, phase, restore_ckpt=None):
     WEIGHT_DECAY = float(t_cfg.get('weight_decay', 1e-4))
     GRAD_CLIP = t_cfg.get('grad_clip', 1.0)
     AMP = t_cfg.get('amp', True)
+    W_ACCEL = float(t_cfg.get('w_accel', 1.0)) 
 
     PAD_MULTIPLE = cfg['pad_multiple']
     DYNAMIC_BATCH_THRESHOLDS = cfg['dynamic_batch']['thresholds']
@@ -347,7 +363,19 @@ def main(cfg, run_cfg, phase, restore_ckpt=None):
 
             with torch.cuda.amp.autocast(enabled=AMP):
                 _, _, _, pred = model.net(imgs, timestep=step_timestep, scale=step_scale, local=local)
-                loss = criterion(pred, gt) / cur_effective_batch
+                loss = criterion(pred, gt)
+                if hasattr(model.net, 'accel_head'):  # AccelFlow only; no-op for plain flow_estimation.py
+                    from model_oldRepo.accel_flow import accel_distillation_loss
+                    loss = loss + W_ACCEL * accel_distillation_loss(
+                        model.net, img0, gt, img1, step_timestep, local=local)
+                    # local=local (NOT hardcoded): accel_head is a shared module
+                    # also invoked inside model.net's main forward above using this
+                    # same `local` setting -- passing it through here keeps
+                    # accel_head's student-side D consistent between the
+                    # photometric branch and the accel-supervision branch, instead
+                    # of silently training it against a different (unrefined)
+                    # input distribution than it will see at inference.
+                loss = loss / cur_effective_batch
 
             scaler.scale(loss).backward()
             steps_since_update += 1

@@ -1,0 +1,90 @@
+# =====================================================================
+# Scene cropping + motion filtering + progressive sequence-length
+# variant config.
+#
+# Run with:
+#   python cropping.py --config cropping_config.yaml
+#
+# This is STAGE 1 of the pipeline. Point augmentation.py's data.data_root
+# at THIS script's output_root below to run pixel augmentation as a
+# second pass over what gets written here.
+# =====================================================================
+
+# input_root and output_root live right here at the top, as requested:
+data:
+  input_root: /mnt/d/trainingData/train_10k      # folder containing one subfolder per scene,
+                                                    # each subfolder full of that scene's frames
+  output_root: null                                # null -> defaults to "<input_root>_cropped_<size>"
+                                                    # (sibling folder, never inside input_root),
+                                                    # where <size> is this run's crop.crop_size, e.g.
+                                                    # "train_10k_cropped_128" or
+                                                    # "train_10k_cropped_320x240" -- this keeps a
+                                                    # size-ladder's runs against the same input_root
+                                                    # from colliding by default.
+  overwrite: false                                 # false -> skip any output folder that already
+                                                    # exists (idempotent reruns); true -> regenerate
+                                                    # and append to manifest.jsonl
+
+  # Frame naming: 000000, 000001, 000002, ... -- zero-padded to
+  # frame_index_digits, starting at frame_index_start. Numbering must be
+  # contiguous (no gaps) within a scene.
+  frame_index_start: 0
+  frame_index_digits: 6
+
+  # Multiple file types are supported -- each index is checked against
+  # every extension below (in order); whichever one matches a scene's
+  # first frame is reused first for the rest of that scene (fast path),
+  # so different scenes can use different formats with no config change.
+  # Yours are .png, listed first; the rest are here so nothing breaks if
+  # you ever mix in a batch exported as jpg/bmp/tiff.
+  frame_extensions: [png, jpg, jpeg, bmp, tif, tiff]
+
+  max_frames_to_probe: 2000                        # safety cap on how high the index is probed per scene
+  min_scene_frames: 3                              # scenes with fewer discovered frames are skipped
+
+crop:
+  # ONE crop size per run (int = square crop, [w, h] = rectangular).
+  # Output folder names always carry the size regardless (e.g. "128",
+  # "320x240") -- to build a size ladder (128, 256, 320x240, 512,
+  # 640x480, 720x480), run this script once per size against the same
+  # input_root, pointing output_root at the same place each time; sizes
+  # never collide in the output naming.
+  crop_size: 128
+
+  max_crops_per_scene: null      # optional cap on the dynamically computed crop count
+                                 # (num_crops = min(w // crop_w, h // crop_h)). null = uncapped.
+  jitter: true                  # true -> each crop randomly placed within its assigned grid cell
+                                 # (reproducible given `seed`). false -> pinned to each cell's
+                                 # top-left corner.
+
+# Rejects/rerolls crop boxes that land on effectively static content
+# (sky, locked-off background, ...) -- see cropping.py's "MOTION GATE"
+# docstring section.
+motion_check:
+  enabled: true
+  min_motion_score: 4.0          # mean grayscale frame-to-frame diff (0-255 scale) within the crop's
+                                 # own box, sampled across the whole scene. Raise this to be stricter
+                                 # about rejecting low-motion crops; lower it if too many scenes are
+                                 # being skipped/rerolled on genuinely subtle-but-real motion.
+  max_frames_to_sample: 10       # how many frames (evenly spaced across the scene) to sample when
+                                 # scoring motion -- kept small since this runs per crop attempt
+  downsample_factor: 4           # spatial downsample applied before scoring, for speed
+  max_reroll_attempts: 8         # how many fresh random boxes to try before giving up on this slot
+  skip_on_failure: true          # true -> drop this crop slot entirely (and log it) if no attempt
+                                 # clears min_motion_score; false -> accept the last attempted box
+                                 # anyway with a logged warning, rather than losing the crop
+
+# Progressive sequence-length variants -- see cropping.py's
+# "SEQUENCE-LENGTH VARIANTS" docstring section. Each new variant keeps
+# the FRONT of the sequence (frame 000000 onward) and is ~ (1 -
+# reduction_pct) of the PREVIOUS variant's length, e.g. reduction_pct=
+# 0.10 on a 100-frame scene yields lengths 100, 90, 81, 72, 64, ...
+sequence:
+  reduction_pct: 0.10             # fraction trimmed off the end of the PREVIOUS variant each step
+  min_frames_to_continue: 5       # keep generating further, shorter variants only while the last one
+                                 # written still has at least this many frames
+  min_output_frames: 3            # never write a variant shorter than this, even if the arithmetic
+                                 # would otherwise produce one
+
+seed: 1                          # governs crop placement AND motion-gate rerolls; reruns with the
+                                 # same seed against the same input_root reproduce identical output

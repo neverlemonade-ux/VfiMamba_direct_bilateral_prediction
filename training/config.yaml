@@ -51,7 +51,7 @@ val:
   validation_native_mode: true
   validation_batch_size: 1
 
-  use_manual_val: false           # true -> skip the seeded split entirely; val comes
+  use_manual_val: True           # true -> skip the seeded split entirely; val comes
                                    # from manual_val_src instead of held-out src_dir scenes
   manual_val_src: ""              # only read when use_manual_val is true. Same layout as
                                    # paths.src_dir: manual_val_src/<Dataset>/<Scene>/frames...
@@ -66,7 +66,7 @@ curriculum:
   # nearest-`pad_multiple` padded long edge. First row (ascending
   # max_long_side) whose threshold is >= the sample's long edge wins.
   phase_buckets:
-    - {max_long_side: 1280,  phase: 1}
+    - {max_long_side: 1000,  phase: 1}
     - {max_long_side: 1920,  phase: 2}
     - {max_long_side: 2560,  phase: 3}
     - {max_long_side: .inf,  phase: 4}

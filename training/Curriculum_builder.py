@@ -43,6 +43,43 @@ tree is scanned recursively and every usable scene becomes one sample.
 > exactly what to do with an `is_extra` batch, it just never used to
 > receive one.
 
+> **Revision note (this revision -- bucket-based accumulation windows):**
+> `group_batches_into_accum_windows()` previously required every batch in
+> a window to share the exact same padded (H,W) resolution. This was
+> stricter than necessary: `config.yaml`'s `dynamic_batch.thresholds`
+> table already treats a RANGE of resolutions as equivalent for
+> batch-sizing purposes (e.g. every resolution with padded long edge
+> <= 640 gets batch_size=10, accum_steps=1) -- the old windowing logic
+> just never took advantage of that, and instead fragmented any run of
+> differing-but-bucket-equivalent resolutions into a series of
+> mostly-partial, single-batch windows.
+>
+> This mattered most for REPLAY batches: `split_retain_export()` and
+> `distribute_export_evenly()` both shuffle exported batches (they are
+> selected/placed by total item count and round-robin count, not sorted
+> by resolution) before they reach `group_batches_into_accum_windows()`.
+> A shuffled stream essentially never has long runs of IDENTICAL exact
+> resolution back-to-back, so under exact-resolution grouping, replay
+> streams were producing almost all size-1 "partial" windows regardless
+> of `accum_steps` -- correct (train.py handles partial windows exactly,
+> via `window_num_items`), but a much smaller effective batch size per
+> replay window than the curriculum's own `dynamic_batch` table intended.
+>
+> Fixed by regrouping on **bucket equivalence** -- `(batch_size,
+> gradient_accumulation)` as resolved by `resolution.resolve_dynamic_batch_metadata`
+> -- rather than on exact `(padded_w, padded_h)` equality. Consecutive
+> non-extra batches whose resolution maps to the same bucket now window
+> together even when their exact padded resolutions differ, so a shuffled
+> replay stream (or an own-progression stream that crosses a
+> sub-threshold resolution bump) reaches full `accum_steps`-sized windows
+> far more often instead of degrading to trailing partials. Each physical
+> batch folder still holds items of exactly ONE resolution (see
+> `group_into_batches` -- that invariant is unchanged and is what lets
+> `dataset.py`/`train.py` treat `batch_uid` as a reliable
+> single-resolution unit); only the WINDOW-level grouping (which
+> consecutive batch folders get flushed/optimized together) now spans
+> resolutions within a shared bucket. See `group_batches_into_accum_windows()`.
+
 === PIPELINE, IN ORDER ===
 
   Step 1 -- EXTRACT: recursively discover every <Dataset>/<Scene> folder
@@ -81,28 +118,38 @@ tree is scanned recursively and every usable scene becomes one sample.
       out as a single folder wherever it lands. See build_curriculum().
 
       ACCUMULATION WINDOWS: within each stream (a phase's own retained
-      batches, and each replay source separately), consecutive
-      same-resolution, non-extra batches are chunked into accumulation
-      windows of exactly accum_steps(resolution) batches
-      (group_batches_into_accum_windows). Every batch in one window is
-      stamped with a shared `window_id` (_tag_windows) plus the window's
-      TRUE total item count (`window_num_items`) -- this is what
-      train.py divides the loss by, and what it flushes the optimizer
-      on, instead of inferring window boundaries from a resolution
-      change or a step count. A resolution run that doesn't have enough
-      batches left to fill a full window becomes a PARTIAL window
-      (fewer than accum_steps batches, `window_is_partial=True`) rather
-      than being discarded -- these partial windows are still fully
-      valid, trainable accumulation windows (train.py just divides by
-      their true, smaller item count), so instead of interleaving them
-      throughout the phase like full windows, they're collected and
-      appended to the END of the phase's stream, after every full
-      (own + replay) window has been emitted. `is_extra` batches (see
-      Step 5) are excluded from window grouping entirely -- they are
-      also collected (as individual batches, not windowed groups) and
-      appended after the trailing partial windows, so they still reach
-      write_phase_folder() and land in Extra/, without ever being tagged
-      with a window_id. See build_curriculum().
+      batches, and each replay source separately), consecutive non-extra
+      batches that resolve to the SAME dynamic_batch BUCKET -- i.e. the
+      same (batch_size, accum_steps) pair via
+      resolution.resolve_dynamic_batch_metadata, not necessarily the same
+      exact padded resolution -- are chunked into accumulation windows of
+      exactly accum_steps(bucket) batches (group_batches_into_accum_windows).
+      Every batch in one window is stamped with a shared `window_id`
+      (_tag_windows) plus the window's TRUE total item count
+      (`window_num_items`) -- this is what train.py divides the loss by,
+      and what it flushes the optimizer on, instead of inferring window
+      boundaries from a resolution change or a step count. A bucket run
+      that doesn't have enough batches left to fill a full window becomes
+      a PARTIAL window (fewer than accum_steps batches,
+      `window_is_partial=True`) rather than being discarded -- these
+      partial windows are still fully valid, trainable accumulation
+      windows (train.py just divides by their true, smaller item count),
+      so instead of interleaving them throughout the phase like full
+      windows, they're collected and appended to the END of the phase's
+      stream, after every full (own + replay) window has been emitted.
+      `is_extra` batches (see Step 5) are excluded from window grouping
+      entirely -- they are also collected (as individual batches, not
+      windowed groups) and appended after the trailing partial windows,
+      so they still reach write_phase_folder() and land in Extra/,
+      without ever being tagged with a window_id. See build_curriculum().
+
+      Note that because windowing is now bucket-based rather than
+      exact-resolution-based, a single accumulation window CAN contain
+      batches of more than one exact padded resolution (as long as they
+      all resolve to the same batch_size/accum_steps bucket). Each
+      individual batch FOLDER is still exactly one resolution -- see
+      group_into_batches -- this only affects which batch folders get
+      grouped into one window together.
 
   Step 5 -- BATCH FOLDERS: write_phase_folder() no longer derives any
       grouping itself -- it just numbers and writes out, in order, the
@@ -168,8 +215,10 @@ curriculum order with a plain nested sorted() walk -- no re-derivation of
 any randomness needed. window_id is an independent, explicit tag on top
 of that ordering -- it does not affect folder naming or numbering, only
 which items dataset.py/train.py treat as belonging to one accumulation
-window. is_extra batches never receive a window_id at all (see the
-revision note above and group_batches_into_accum_windows).
+window (now bucket-scoped, not exact-resolution-scoped -- see the
+revision note above). is_extra batches never receive a window_id at all
+(see the Extra/-routing revision note above and
+group_batches_into_accum_windows).
 
 This script is NOT incremental (no manifest / no append-in-place) --
 every run rebuilds TrainingData/ and ValidationData/ from scratch from the
@@ -342,6 +391,15 @@ def group_into_batches(seqs, phase_num, multiple, dynamic_batch_thresholds):
     from a single phase's own data and then travel as whole units
     through everything downstream (see this module's docstring).
 
+    Every batch built here still holds items of exactly ONE exact padded
+    resolution -- this invariant is unchanged by the bucket-based
+    accumulation-window grouping described in this module's docstring
+    (see group_batches_into_accum_windows); only the WINDOW-level
+    grouping (which whole batch folders get flushed/optimized together)
+    was relaxed from exact-resolution equality to bucket equality. A
+    batch folder's `resolution` field and the training items it contains
+    remain single-resolution by construction here.
+
     A run's final leftover chunk, if shorter than that resolution's
     configured batch_size, is flagged is_extra=True -- too small to
     reach a full effective batch, so write_phase_folder() routes it to
@@ -421,6 +479,15 @@ def split_retain_export(batches, seed, phase_num, retain_ratio, has_later_phases
     batches are seeded-shuffled (their internal order doesn't carry
     meaning, just needs to be reproducible) before being handed off for
     even round-robin assignment to later phases.
+
+    NOTE on downstream windowing: because EXPORTED batches are shuffled
+    here (and shuffled again in distribute_export_evenly), a replay
+    stream arriving at a later phase is generally NOT sorted by
+    resolution, so long runs of exact-resolution-identical batches are
+    rare by chance. group_batches_into_accum_windows() groups by
+    dynamic_batch BUCKET rather than exact resolution specifically to
+    keep these shuffled replay streams from fragmenting into mostly
+    single-batch partial windows -- see this module's top docstring.
     """
     if not has_later_phases or retain_ratio >= 1.0:
         return batches, []
@@ -463,23 +530,34 @@ def distribute_export_evenly(export_batches, seed, phase_num, dest_phases):
 
 def group_batches_into_accum_windows(batches, dynamic_batch_thresholds, multiple):
     """Chunk an ordered list of batch objects into accumulation-window
-    groups: consecutive same-resolution, NON-EXTRA batches, taken
-    accum_steps at a time (accum_steps looked up per-resolution from
-    dynamic_batch). is_extra batches are skipped entirely for window
-    grouping purposes -- they always go to Extra/ via write_phase_folder
-    regardless of window logic, and dataset.py never trains on Extra/
-    content, so including them in a window would just corrupt that
-    window's true item count for no benefit.
+    groups: consecutive NON-EXTRA batches that resolve to the SAME
+    dynamic_batch BUCKET -- i.e. the same (batch_size,
+    gradient_accumulation) pair via resolution.resolve_dynamic_batch_metadata
+    -- taken accum_steps at a time. This is bucket equivalence, not exact
+    (padded_w, padded_h) equality: two batches at different exact
+    resolutions window together as long as config.yaml's dynamic_batch
+    table assigns them the same batch_size/accum_steps (see the
+    bucket-based-accumulation-windows revision note at the top of this
+    file for why this matters, especially for shuffled replay streams).
+    Each individual batch folder itself still holds items of exactly one
+    exact resolution (see group_into_batches) -- only the window grouping
+    spans resolutions within a shared bucket.
+
+    is_extra batches are skipped entirely for window grouping purposes --
+    they always go to Extra/ via write_phase_folder regardless of window
+    logic, and dataset.py never trains on Extra/ content, so including
+    them in a window would just corrupt that window's true item count
+    for no benefit.
 
     Returns (full_groups, partial_groups, extra_batches):
-      - full_groups: groups that reached exactly accum_steps(resolution)
+      - full_groups: groups that reached exactly accum_steps(bucket)
         batches -- these are what interleave_grouped_streams places
         throughout the phase, same as before.
-      - partial_groups: the trailing remainder of a same-resolution run
-        that ended before reaching accum_steps (at most one per run).
-        These are NOT discarded -- a partial window is still a fully
-        valid, trainable accumulation window; train.py just divides its
-        loss by the window's true (smaller) item count instead of the
+      - partial_groups: the trailing remainder of a same-bucket run that
+        ended before reaching accum_steps (at most one per run). These
+        are NOT discarded -- a partial window is still a fully valid,
+        trainable accumulation window; train.py just divides its loss by
+        the window's true (smaller) item count instead of the
         theoretical batch_size*accum_steps target. build_curriculum()
         collects every partial group (own + each replay source) for a
         phase and appends them to the END of that phase's stream, after
@@ -487,17 +565,17 @@ def group_batches_into_accum_windows(batches, dynamic_batch_thresholds, multiple
       - extra_batches: every is_extra batch encountered in `batches`,
         in their original relative order, returned as individual batch
         dicts (NOT grouped into windows -- they never get a window_id).
-        BUGFIX (see the revision note at the top of this file): these
-        used to be silently dropped here -- flushed out of the current
-        run-in-progress and then discarded, never returned to the
-        caller. build_curriculum() now collects this list (own stream +
-        every replay source, mirroring how it already collects
+        BUGFIX (see the Extra/-routing revision note at the top of this
+        file): these used to be silently dropped here -- flushed out of
+        the current run-in-progress and then discarded, never returned
+        to the caller. build_curriculum() now collects this list (own
+        stream + every replay source, mirroring how it already collects
         partial_groups) and appends the batches to the end of the
         phase's final order, so write_phase_folder() actually receives
         them and routes them to Extra/ as originally intended.
     """
     full_groups, partial_groups, extra_batches = [], [], []
-    cur_group, cur_res, cur_target = [], None, None
+    cur_group, cur_bucket_key, cur_target = [], None, None
 
     def _flush():
         if not cur_group:
@@ -511,25 +589,32 @@ def group_batches_into_accum_windows(batches, dynamic_batch_thresholds, multiple
         if b['is_extra']:
             # Extra batches never participate in window grouping -- flush
             # whatever run was in progress (an is_extra batch breaks a
-            # same-resolution run just like a resolution change would,
-            # since it's about to be pulled out to Extra/ regardless),
-            # then record the batch itself so it isn't lost -- see the
-            # BUGFIX note above and in this function's docstring.
+            # same-bucket run just like a bucket change would, since it's
+            # about to be pulled out to Extra/ regardless), then record
+            # the batch itself so it isn't lost -- see the BUGFIX note
+            # above and in this function's docstring.
             _flush()
-            cur_group, cur_res, cur_target = [], None, None
+            cur_group, cur_bucket_key, cur_target = [], None, None
             extra_batches.append(b)
             continue
 
         pw, ph = b['resolution']
         dyn = resolution.resolve_dynamic_batch_metadata(pw, ph, dynamic_batch_thresholds, multiple)
         accum_steps = dyn['gradient_accumulation']
-        if cur_res is None or b['resolution'] != cur_res:
+        # Bucket key, NOT exact resolution: two different exact padded
+        # resolutions with the same (batch_size, accum_steps) are the
+        # same bucket and window together. batch_size is included in the
+        # key (not just accum_steps) so that a coincidental accum_steps
+        # match across two genuinely different buckets can never merge
+        # windows meant to carry different effective batch sizes.
+        bucket_key = (dyn['batch_size'], accum_steps)
+        if cur_bucket_key is None or bucket_key != cur_bucket_key:
             _flush()
-            cur_group, cur_res, cur_target = [], b['resolution'], accum_steps
+            cur_group, cur_bucket_key, cur_target = [], bucket_key, accum_steps
         cur_group.append(b)
         if len(cur_group) == cur_target:
             full_groups.append(cur_group)
-            cur_group, cur_res, cur_target = [], None, None
+            cur_group, cur_bucket_key, cur_target = [], None, None
     _flush()
     return full_groups, partial_groups, extra_batches
 
@@ -541,11 +626,19 @@ def _tag_windows(groups, counter, dynamic_batch_thresholds, multiple, is_partial
     phases or between an own-stream and a replay-stream), plus the
     window's TRUE total item count (window_num_items) and, for
     reference/logging only, the theoretical target item count a FULL
-    window at this resolution would have (window_target_items).
+    window at this bucket would have (window_target_items).
 
     window_num_items is what train.py actually divides the loss by and
     flushes the optimizer on -- not a table lookup -- so it is exact by
-    construction for both full and partial windows.
+    construction for both full and partial windows, even when a window
+    spans more than one exact resolution within the same bucket (see
+    group_batches_into_accum_windows).
+
+    Every batch in `groups[i]` shares the same (batch_size,
+    gradient_accumulation) bucket by construction (that's the grouping
+    key used upstream), so looking up dyn from g[0]'s resolution alone is
+    sufficient to get the correct target_items for the whole group, even
+    if other members of the group are a different exact resolution.
 
     NEVER called on extra_batches (see group_batches_into_accum_windows)
     -- is_extra batches must never carry a window_id.
@@ -571,9 +664,10 @@ def build_curriculum(train_seqs, cfg, seed):
     phases (distribute_export_evenly), and then -- separately, per
     stream (own retained + each individual replay source) --
     group_batches_into_accum_windows() chunks non-extra batches into
-    full/partial accumulation windows AND collects any is_extra batches
-    encountered (see that function's docstring and the BUGFIX revision
-    note at the top of this file).
+    full/partial accumulation windows (by dynamic_batch BUCKET, not
+    exact resolution -- see that function) AND collects any is_extra
+    batches encountered (see that function's docstring and the
+    Extra/-routing BUGFIX revision note at the top of this file).
 
     Full windows are interleaved (interleave_grouped_streams); partial
     windows are appended after that, in stream order (own's partial
@@ -704,6 +798,12 @@ def write_phase_folder(phase_num, ordered_batches, training_root, multiple,
     window_num_items, window_target_items, window_is_partial) -- is_extra
     batches never go through window grouping, so they have none of these
     fields and dataset.py never reads them for Extra/ content anyway.
+    As of the bucket-based-accumulation-windows revision (see top-of-file
+    note), a window_id may now be shared by batches of DIFFERENT exact
+    resolutions (same dynamic_batch bucket) -- this function still just
+    writes each batch folder under its own single resolution's name
+    (`dyn["resolution"]`), so on-disk batch folder naming/content is
+    unaffected either way.
 
     Writes batch_metadata.yaml per batch, extra_metadata.yaml (only if
     this phase's Extra/ ends up non-empty) summarizing every batch
@@ -892,11 +992,13 @@ def interleave_grouped_streams(own_groups, replay_pool_groups):
 
     Spreads each replay stream's groups evenly across the GAPS between
     own groups (never inside one), so every accumulation window --
-    whether own or replay -- is built from batches of exactly one
-    resolution. Returns a flat list of (origin_label, batch) tuples,
-    ready for write_phase_folder -- group membership is preserved
-    because each group's batches are always emitted together,
-    back-to-back, uninterrupted by anything else.
+    whether own or replay -- is built from batches that share one
+    dynamic_batch BUCKET (batch_size/accum_steps) -- see
+    group_batches_into_accum_windows for why this is bucket equivalence
+    rather than exact-resolution equality. Returns a flat list of
+    (origin_label, batch) tuples, ready for write_phase_folder -- group
+    membership is preserved because each group's batches are always
+    emitted together, back-to-back, uninterrupted by anything else.
     """
     own_seq = [('__primary__', b) for g in own_groups for b in g]
     if not replay_pool_groups:
