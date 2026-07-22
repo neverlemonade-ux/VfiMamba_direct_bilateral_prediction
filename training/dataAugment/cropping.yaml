@@ -74,24 +74,20 @@ motion_check:
                                  # clears min_motion_score; false -> accept the last attempted box
                                  # anyway with a logged warning, rather than losing the crop
 
-# Progressive sequence-length variants -- see cropping.py's
-# "SEQUENCE-LENGTH VARIANTS" docstring section. Each new variant keeps
-# the FRONT of the sequence (frame 000000 onward) and is ~ (1 -
-# reduction_pct) of the PREVIOUS variant's length, e.g. reduction_pct=
-# 0.10 on a 100-frame scene yields lengths 100, 90, 81, 72, 64, ...
-sequence:
-  reduction_pct: 0.10             # fraction trimmed off the end of the PREVIOUS variant each step
-  min_frames_to_continue: 5       # keep generating further, shorter variants only while the last one
-                                 # written still has at least this many frames
-  min_output_frames: 3            # never write a variant shorter than this, even if the arithmetic
-                                 # would otherwise produce one
-
-seed: 1                          # governs crop placement AND motion-gate rerolls; reruns with the
-                                 # same seed against the same input_root reproduce identical output
-
+# Progressive sequence-window variants -- see cropping.py's
+# "SEQUENCE-WINDOW VARIANTS -- WHAT AND WHY" docstring section. Each
+# step trims a percentage of the CURRENT window off BOTH ends (that
+# percentage grows step over step via accel_rate), and three sweep
+# schedules are run per crop, differing only in how each step's trim is
+# split between the two ends -- see compute_sequence_windows.
 sequence:
   reduction_pct: 0.05           # trim fraction applied at step 0 (small, slow start)
   accel_rate: 0.5               # growth multiplier per step (each step trims 1.5x the last fraction)
   sweeps: [symmetric, front_to_back, back_to_front]   # which schedules to run per crop
-  min_frames_to_continue: 5
-  min_output_frames: 3
+  min_frames_to_continue: 5     # keep generating further, shorter variants only while the last one
+                                 # written still has at least this many frames
+  min_output_frames: 3          # never write a variant shorter than this, even if the arithmetic
+                                 # would otherwise produce one
+
+seed: 1                          # governs crop placement AND motion-gate rerolls; reruns with the
+                                 # same seed against the same input_root reproduce identical output

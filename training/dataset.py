@@ -98,6 +98,40 @@ worker_init_fn seeds once per worker and which would otherwise make every
 epoch repeat the same picks). train.py MUST call
 train_set.set_epoch(epoch) at the start of every epoch for this to work --
 see that file's training loop.
+
+=== PER-PHASE MAX FRAME SPAN (clip sampling for long scenes) ===
+Some source scenes run to hundreds or thousands of frames. Using a
+scene's literal first/last present frame as img0/img1 (the pre-existing
+behavior) means the motion between img0 and img1 can span many seconds of
+real footage -- far outside what a two-frame flow-based VFI model (cost
+volumes, local correlation, linear/accel motion models) has any basis to
+interpolate correctly, especially in EARLY curriculum phases where the
+whole point is to establish small, well-posed motion before progressing
+to harder cases.
+
+data.max_frame_span_by_phase in config.yaml (read by prepare_datasets and
+passed into FullResVFIDataset as `max_frame_span`) caps this per phase.
+When a scene's frame count exceeds `max_frame_span`, __getitem__ draws a
+random contiguous SUB-CLIP of length in [3, max_frame_span] from the
+scene (seeded the same way as the timestep pick: keyed on
+(seed, epoch, sample_id), so it's reproducible per-epoch and changes from
+one epoch to the next -- see set_epoch()) and runs the existing
+interior-frame/timestep selection on that clip instead of on the whole
+scene. img0/img1 become the clip's first/last frame, not the scene's.
+Scenes at or under the cap (or when max_frame_span is None for a phase)
+are unaffected and use the whole scene, exactly as before.
+
+This is a per-item CLIP, not a train.py accumulation WINDOW -- window_id/
+window_num_items (see above) are a completely separate concept (gradient
+accumulation boundaries across many items) and are untouched by this
+feature; deliberately different terminology is used here to avoid
+confusion between the two.
+
+Validation is NOT clipped by this mechanism -- val always uses the full
+scene's first/last frame and enumerates every interior frame up to
+val_max_interior_per_seq, same as before. If val scenes are also very
+long, this means val motion spans may not match what a given phase was
+trained on.
 """
 import os
 import re
@@ -225,15 +259,25 @@ class FullResVFIDataset(Dataset):
     true item count (window_id, window_num_items) -- see this module's
     docstring.
 
+    If max_frame_span is set and a scene's frame count exceeds it, a
+    random contiguous sub-clip (length in [3, max_frame_span], also
+    per-epoch seeded) is drawn first, and interior-frame selection runs
+    on that clip instead of the whole scene -- see this module's
+    docstring, "PER-PHASE MAX FRAME SPAN".
+
     mode='val': reads ValidationData/ (nested Dataset/Scene, see
     _list_val_seq_dirs). Every interior frame of every sequence is
     enumerated once at construction (capped via val_max_interior_per_seq),
-    fixed order, deterministic across epochs.
+    fixed order, deterministic across epochs. NOT affected by
+    max_frame_span -- val always spans the full scene.
     """
 
     def __init__(self, split_dir, mode, frame_names, image_extensions, pad_multiple,
-                 seed, val_max_interior_per_seq=4, log=print):
+                 seed, val_max_interior_per_seq=4, max_frame_span=None, log=print):
         assert mode in ('train', 'val')
+        if max_frame_span is not None and max_frame_span < 3:
+            raise ValueError(f'max_frame_span must be >= 3 (got {max_frame_span})')
+        self.max_frame_span = max_frame_span
         self.split_dir = split_dir
         self.mode = mode
         self.frame_names = frame_names
@@ -278,6 +322,9 @@ class FullResVFIDataset(Dataset):
         if skipped:
             log(f'  [{mode}] {skipped} folder(s) under {split_dir} had < 3 frames present, skipped')
         log(f'  [{mode}] {len(self.items)} item(s) from {split_dir}')
+        if mode == 'train' and self.max_frame_span is not None:
+            log(f'  [{mode}] max_frame_span={self.max_frame_span} '
+                f'(scenes longer than this will be randomly sub-clipped per epoch)')
         if skipped and not self.items:
             log(f'  [{mode}] WARNING: everything under {split_dir} was skipped -- check '
                 f'data.frame_names against the actual files on disk.')
@@ -297,9 +344,11 @@ class FullResVFIDataset(Dataset):
     def set_epoch(self, epoch):
         """Call once at the start of every training epoch (train.py's
         training loop, before iterating train_loader). Changes the salt
-        fed into the per-item timestep RNG in __getitem__, so the
-        interior-frame/timestep pick varies deterministically from one
-        epoch to the next instead of being fixed for the whole run.
+        fed into the per-item timestep RNG (and, when max_frame_span
+        applies, the sub-clip RNG -- same rng instance, see __getitem__)
+        in __getitem__, so both the sub-clip and the interior-frame pick
+        vary deterministically from one epoch to the next instead of
+        being fixed for the whole run.
 
         NOTE on DataLoader worker processes: this only reaches
         already-running persistent workers if the DataLoader is recreated
@@ -334,27 +383,46 @@ class FullResVFIDataset(Dataset):
         if self.mode == 'train':
             seq_dir, present, sample_id, batch_uid, window_id, window_num_items = self.items[idx]
             n = len(present)
-            if n == 3:
-                k = 1
+            rng = seeding.rng_for(self.seed, 'timestep', self.epoch, sample_id)
+
+            if self.max_frame_span is not None and n > self.max_frame_span:
+                # Still random per epoch -- this controls which SUB-CLIP of a
+                # long scene is visible this epoch, not which frame within it.
+                clip_len = rng.randint(3, self.max_frame_span)
+                start = rng.randint(0, n - clip_len)
+                clip = present[start:start + clip_len]
             else:
-                rng = seeding.rng_for(self.seed, 'timestep', self.epoch, sample_id)
-                k = rng.randint(1, n - 2)
+                clip = present
+
+            cn = len(clip)
+            img0_name, img1_name = clip[0], clip[-1]
+            # ALL interior frames now, not one random pick.
+            interior_ks = list(range(1, cn - 1))
+            gt_names = [clip[k] for k in interior_ks]
+            timesteps = [k / (cn - 1) for k in interior_ks]
         else:
             seq_dir, present, k = self.items[idx]
             n = len(present)
+            img0_name, gt_name, img1_name = present[0], present[k], present[-1]
+            timestep = k / (n - 1)
 
-        img0 = self._load(seq_dir, present[0])
-        gt = self._load(seq_dir, present[k])
-        img1 = self._load(seq_dir, present[-1])
-        timestep = k / (n - 1)
-
+        img0 = self._load(seq_dir, img0_name)
         img0_t, h, w = self._to_padded_tensor(img0)
-        gt_t, _, _ = self._to_padded_tensor(gt)
+        img1 = self._load(seq_dir, img1_name)
         img1_t, _, _ = self._to_padded_tensor(img1)
 
         if self.mode == 'train':
-            return (img0_t, gt_t, img1_t, torch.tensor(timestep, dtype=torch.float32),
+            # (num_interior, C, H, W) -- num_interior varies per item, but
+            # DataLoader batch_size=1 means default collate just adds a
+            # leading dim of 1, so no custom collate_fn is needed.
+            gt_stack = torch.stack(
+                [self._to_padded_tensor(self._load(seq_dir, name))[0] for name in gt_names], dim=0)
+            timesteps_t = torch.tensor(timesteps, dtype=torch.float32)
+            return (img0_t, gt_stack, img1_t, timesteps_t,
                     h, w, batch_uid, window_id, window_num_items)
+
+        gt = self._load(seq_dir, gt_name)
+        gt_t, _, _ = self._to_padded_tensor(gt)
         return (img0_t, gt_t, img1_t, torch.tensor(timestep, dtype=torch.float32), h, w)
 
 
@@ -364,6 +432,12 @@ def prepare_datasets(cfg, phase, log=print):
     Dataset. Both are read-only over a curriculum ALREADY BUILT by
     curriculum_builder.py -- this function does not split or shuffle
     anything itself; run curriculum_builder.py first.
+
+    data.max_frame_span_by_phase (config.yaml) is looked up for this
+    phase and passed into the train Dataset as max_frame_span -- a
+    missing phase key, a missing max_frame_span_by_phase table entirely,
+    or an explicit null/None all mean "no cap" for this phase. The val
+    Dataset never receives this value -- see this module's docstring.
     """
     dataset_root = cfg['paths']['dataset_root']
     phase_dir = os.path.join(dataset_root, 'TrainingData', f'Phase{phase}')
@@ -380,9 +454,12 @@ def prepare_datasets(cfg, phase, log=print):
     pad_multiple = cfg['pad_multiple']
     seed = cfg['seed']
 
+    max_span_by_phase = d_cfg.get('max_frame_span_by_phase', {}) or {}
+    max_frame_span = max_span_by_phase.get(phase)
+
     train_set = FullResVFIDataset(
         phase_dir, 'train', d_cfg['frame_names'], image_extensions, pad_multiple,
-        seed=seed, log=log)
+        seed=seed, max_frame_span=max_frame_span, log=log)
 
     val_set = FullResVFIDataset(
         val_dir, 'val', d_cfg['frame_names'], image_extensions, pad_multiple,
@@ -396,4 +473,4 @@ def prepare_datasets(cfg, phase, log=print):
     if len(val_set) == 0:
         log('  WARNING: val set has 0 items -- val_loss/PSNR will be meaningless this run.')
 
-    return train_set, val_set 
+    return train_set, val_set

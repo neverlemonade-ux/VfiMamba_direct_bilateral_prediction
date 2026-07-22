@@ -68,24 +68,46 @@ e.g. `train_10k_cropped_128`), a folder of output scene folders, plus a
 4. **Crop every frame through the passing box, once.** One crop pass per
    box — not one per output variant.
 
-5. **Slice that cropped sequence into progressively shorter variants.**
-   All variants keep the *front* of the sequence and trim off the *end*.
-   Each new length is ~90% of the *previous* variant's length (not 90% of
-   the original), so a 100-frame scene yields:
-   ```
-   100 → 90 → 81 → 72 → 64 → ...
-   ```
-   This keeps going as long as the last variant is still ≥
-   `min_frames_to_continue`, and never produces anything shorter than
-   `min_output_frames`. This gives the model training examples across a
-   range of effective clip durations, without re-picking the crop
-   position or re-running the motion gate for each length.
+5. **Slice that cropped sequence into progressively narrower variants,
+   trimmed from both ends, swept three different ways.** Each step trims
+   a *percentage of the current window* off **both** the front and the
+   back — that percentage starts small and grows step over step
+   (`reduction_pct` at step 0, accelerating by `accel_rate` each
+   subsequent step). Anchoring every shorter variant at frame 0 (trim the
+   end only) barely moves the *middle* of the clip between variants,
+   since sampling during training happens around a random middle frame —
+   so trimming both ends instead means each variant actually samples a
+   different part of the scene, not just a shorter version of the same
+   part.
+
+   On top of that, **three independent sweep schedules** run per crop,
+   differing only in how each step's trim is split between front and
+   back:
+
+   | Sweep | How the trim is split |
+   |---|---|
+   | `symmetric` | ~50/50 front/back at every step |
+   | `front_to_back` | starts front-heavy, drifts to back-heavy as the window narrows |
+   | `back_to_front` | starts back-heavy, drifts to front-heavy as the window narrows |
+
+   All three schedules start from the same full-length window, so that
+   shared window is written once (not three times); every narrower
+   window is tagged with whichever schedule produced it. Because the
+   three schedules diverge in different directions, they land on
+   different frame-index windows of the *same length* at the *same
+   step* — i.e. more genuinely distinct training examples out of one
+   crop, not just more copies of the same shrink. This continues as long
+   as the last window written is still ≥ `min_frames_to_continue`, and
+   never produces anything narrower than `min_output_frames`.
 
 6. **Write output folders + manifest.** Each folder name encodes the
-   scene, crop size, crop index (if more than one crop), and frame count,
-   e.g. `scene003_128_00_f090`. `manifest.jsonl` records, per folder: the
-   source scene, crop box, source resolution, full-scene frame count,
-   this variant's frame count, motion score, and reroll attempts.
+   scene, crop size, crop index (if more than one crop), the window's
+   start offset and frame count, and — for every variant except the one
+   shared full-length window — which sweep schedule produced it, e.g.
+   `scene003_128_00_s005_f072_sym`. `manifest.jsonl` records, per folder:
+   the source scene, crop box, source resolution, full-scene frame count,
+   sweep schedule, window start/end, this variant's frame count, motion
+   score, and reroll attempts.
 
 ### Key config knobs (`cropping_config.yaml`)
 
@@ -96,8 +118,11 @@ e.g. `train_10k_cropped_128`), a folder of output scene folders, plus a
 | `crop` | `crop_size` | One size per run — int (square) or `[w, h]` |
 | `crop` | `max_crops_per_scene` | Cap on dynamically-computed crop count |
 | `motion_check` | `min_motion_score` | How much motion a crop must show to be kept |
-| `sequence` | `reduction_pct` | How much shorter each successive variant is |
-| `sequence` | `min_output_frames` | Floor on how short a variant can get |
+| `sequence` | `reduction_pct` | Trim fraction applied at step 0 (small, slow start) |
+| `sequence` | `accel_rate` | Growth multiplier on the trim fraction per step (slow start, faster later) |
+| `sequence` | `sweeps` | Which of the three sweep schedules (`symmetric`, `front_to_back`, `back_to_front`) to run per crop |
+| `sequence` | `min_frames_to_continue` | Keep generating narrower variants only while the last one is still at least this long |
+| `sequence` | `min_output_frames` | Floor on how narrow a variant can get |
 
 To build a **size ladder** (e.g. 128, 256, 320×240...), rerun this script
 once per size against the same `input_root` — output names disambiguate
@@ -146,8 +171,9 @@ folder.
 
 - **`reverse` (temporal):** the only surviving temporal augmentation —
   plays a folder's frames backwards. (The old `variable_interval`
-  augmentation was removed: cropping.py's sequence-length variants now
-  cover "vary the effective duration" directly.)
+  augmentation was removed: cropping.py's sequence-window variants now
+  cover "vary the effective duration and which part of the scene is
+  sampled" directly.)
 - **Duplication:** a folder can be duplicated into 2+ output copies, each
   independently drawing its own tier-2/tier-3 augmentation combo (checked
   for uniqueness against its siblings). All duplicates of one folder still
@@ -173,7 +199,7 @@ folder.
 ## Running it end to end
 
 ```bash
-# Stage 1: crop + motion-filter + generate length variants
+# Stage 1: crop + motion-filter + generate sequence-window variants
 python cropping.py --config cropping_config.yaml
 
 # Stage 2: point at Stage 1's output, apply pixel augmentation

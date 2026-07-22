@@ -5,6 +5,8 @@
 - `accel_flow.py` — extends `flow_estimation.py` with a learned, explicitly-supervised acceleration term, so the motion model isn't restricted to constant velocity. Also owns the arbitrary/multi-timestep inference path (`forward_multi_t`), so a single acceleration guess is reused for any requested intermediate frame(s) instead of being recomputed or silently dropped.
 - `configCustom.py` — model config / class wiring. Must import `AccelFlow` from `accel_flow.py` directly rather than going through the package's `mamba_estimation` alias (see §4).
 - `Trainer.py` — adds `inference_multi_t`, the public entry point for interpolating at an arbitrary list of intermediate timesteps in one pass.
+- `dataset.py` — adds per-phase max frame span clipping for long training scenes (see §8).
+- `train.py` — three bugs surfaced while wiring this up against the actual training loop (see §9).
 
 ---
 
@@ -89,6 +91,14 @@ This is the part that makes "teach it actual acceleration" concrete rather than 
 
 `training_step(...)` wires this together: it runs the student's blind forward pass, computes the photometric loss on the reconstructed frame, computes the privileged `a_true` target under `torch.no_grad()`, and combines both losses. `t_gt` is accepted as a python float or a per-sample tensor, so datasets that pick a different interior frame position per item (per `train.py`'s per-epoch seeded timestep selection) work unmodified.
 
+### Edge case, flagged but not yet fixed: `solve_accel_target`'s eps clamp near t≈0/1
+```python
+denom = t_gt * (t_gt - 1)
+denom = torch.where(denom.abs() < eps, torch.full_like(denom, eps), denom) \
+    if torch.is_tensor(denom) else (denom if abs(denom) > eps else eps)
+```
+For any `t_gt` strictly in `(0,1)`, `t_gt·(t_gt-1)` is always **negative**. The clamp above substitutes a bare `+eps` (positive) whenever `|denom| < eps`, so right at the boundary — `t_gt` within `eps=1e-4` of 0 or 1 — the substituted denominator has the **wrong sign**, flipping the sign of `a_true` for that item instead of just avoiding a division by zero. This doesn't error and won't show up as a crash; it silently corrupts the accel target for whichever items happen to land that close to an endpoint. Not fixed here since it depends on whether your dataset's interior-frame sampling can actually produce `t_gt` that close to 0/1 (Vimeo90k's fixed `t=0.5` never triggers it; a variable-`t` dataset like X4K1000FPS might, depending on how interior frames are chosen). If it matters for your data, replace the bare `eps` with a sign-preserving clamp (e.g. `-eps` when `denom` is negative, which it always is in-range) rather than a constant.
+
 ### Arbitrary-timestep inference: `forward_multi_t` override (fix)
 `AccelFlow` inherits `MultiScaleFlow.forward()`/`estimate_flow_and_mask()` overrides that correctly route through `flow_from_bi_accel`. **`forward_multi_t`, however, needed its own override.** The base class's `forward_multi_t` computes `bi_flow`/`visibility` once and then calls `self.flow_from_bi(bi_flow, t)` — the **linear-only** formula — per timestep. Left un-overridden, calling the Nx/multi-t path on an `AccelFlow` instance would silently ignore `accel_head` for every requested timestep, defeating the entire point of this file.
 
@@ -142,7 +152,7 @@ Fix:
 - The **teacher** pass (real flow from `img0` to `img_mid_gt`) always uses `local=True` regardless of the argument, since it runs under `torch.no_grad()` (costs nothing at inference time) and a better-refined target is strictly better supervision for `a_true`.
 - `AccelFlow.training_step` got the same fix for anyone calling it directly instead of the standalone function.
 
-Separately (not fixed, just flagged for awareness): `accel_distillation_loss` always recomputes `estimate_bi_flow` at **native resolution**, ignoring `step_scale` — meaning a training step with `accel_head` active runs the expensive backbone **3 times** (once at `step_scale` for the main forward, twice at full resolution for the accel loss's student+teacher passes). On a single RTX 3090, this bypasses the exact memory-management purpose `train_scale`/`dynamic_batch` were built for, and could OOM at higher-resolution curriculum phases even though the main path would fit. Worth checking VRAM headroom at your largest curriculum phase; if it's tight, consider adding an analogous downsample/upsample step to the accel loss's two `estimate_bi_flow` calls.
+Separately (not fixed, just flagged for awareness): `accel_distillation_loss` always recomputes `estimate_bi_flow` at **native resolution**, ignoring `step_scale` — meaning a training step with `accel_head` active runs the expensive backbone **3 times** (once at `step_scale` for the main forward, twice at full resolution for the accel loss's student+teacher passes), and this cost further multiplies by `num_interior` in the current `train.py` loop, since `accel_distillation_loss` is called once per interior frame rather than once per item (see §9). On a single RTX 3090, this bypasses the exact memory-management purpose `train_scale`/`dynamic_batch` were built for, and could OOM at higher-resolution curriculum phases even though the main path would fit. Worth checking VRAM headroom at your largest curriculum phase; if it's tight, consider adding an analogous downsample/upsample step to the accel loss's two `estimate_bi_flow` calls, and/or hoisting the student's `estimate_bi_flow`/`accel_head` call out of the per-interior-frame loop so it runs once per item instead of once per interior frame.
 
 ## 6. `feature_extractor.py` — no changes needed
 
@@ -155,3 +165,79 @@ Public entry point mirroring `inference`/`hr_inference`, for interpolating at an
 model.inference_multi_t(img0, img1, local, timesteps=[0.1, 0.35, 0.5, 0.72, 0.9], scale=0)
 ```
 Internally calls `self.net.forward_multi_t(imgs, timesteps, local=local, scale=scale)`, which (for `AccelFlow`) now correctly reuses a single acceleration guess across every timestep requested (see §3).
+
+---
+
+## 8. `dataset.py` — per-phase max frame span (long-scene clipping)
+
+### Problem
+Some source scenes (movie footage, ~24fps) run to hundreds or thousands of frames. Before this change, `FullResVFIDataset.__getitem__` always used a scene's literal first and last present frame as `img0`/`img1`, regardless of scene length — so a 1000-frame scene could produce an `img0`↔`img1` pair separated by many seconds of real screen time, in *any* curriculum phase, including Phase 1. This is far outside what a two-frame, flow-based VFI model (cost volumes, local correlation, the linear/accel bidirectional motion model from §2–3) has any basis to interpolate: at multi-second gaps there's frequently no single well-defined "correct" middle frame (shot changes, large non-rigid motion, occlusion), so training on these pairs risks noisy, uninformative gradients rather than a genuine curriculum from easy to hard motion.
+
+### Fix
+`config.yaml` gains `data.max_frame_span_by_phase`, a per-phase cap on how many frames apart `img0`/`img1` may be:
+
+```yaml
+data:
+  max_frame_span_by_phase:
+    1: 5
+    2: 10
+    3: 18
+    4: 24     # ~1 second at 24fps
+```
+A phase with no entry (or an explicit `null`) is uncapped, matching the pre-existing behavior.
+
+`prepare_datasets(cfg, phase, log)` looks up this phase's value and passes it into the **train** `FullResVFIDataset` as `max_frame_span` (the **val** dataset never receives it — validation still spans the full scene, matching pre-existing behavior, since val is meant to measure the model against its full evaluation range rather than a phase-scoped training distribution).
+
+In `FullResVFIDataset.__getitem__`, when `max_frame_span` is set and a scene's frame count `n` exceeds it:
+1. A random contiguous sub-clip of length in `[3, max_frame_span]` is drawn from the scene, using the same per-epoch-seeded RNG (`seeding.rng_for(seed, 'timestep', epoch, sample_id)`) already used for the interior-frame pick — so the clip is reproducible for a given `(seed, epoch, scene)` and changes from one epoch to the next, meaning a long scene's full frame range still gets sampled over the course of training, just never all at once.
+2. `img0`/`gt`/`img1` and `timestep` are then selected from that clip exactly as before (uniform interior pick, or the midpoint when the clip is exactly 3 frames long), instead of from the whole scene.
+
+Scenes at or under the cap, and any phase with `max_frame_span=None`, are unaffected and behave exactly as before this change.
+
+### Naming note
+This is deliberately called a **clip**, not a "window" — `train.py`/`curriculum_builder.py` already use `window_id`/`window_num_items` for a completely unrelated concept (gradient-accumulation flush boundaries across many items). The two are unrelated and orthogonal: clipping happens per-item inside `__getitem__`, before an item ever reaches `train.py`'s accumulation logic.
+
+### What this does *not* touch
+- `curriculum_builder.py`: phase assignment and batching are by **resolution**, not scene length — no changes needed there.
+- `train.py`: accumulation windows are by resolution bucket, not scene length — no changes needed there either.
+- Validation: PSNR/val_loss still reflect full-scene motion spans. If val scenes are also very long, this means validation isn't phase-scoped the way training now is — worth revisiting if val metrics need to track a given phase's trained motion range specifically.
+
+---
+
+## 9. `train.py` — bugfixes surfaced during integration
+
+Three separate bugs turned up while tracing `train.py` against the actual shapes/behavior of the files above. None are design changes — all are the training loop failing to keep up with the multi-interior-frame / accel-head / padding behavior introduced elsewhere in this doc.
+
+### 9.1 Missing import for `accel_distillation_loss`
+The `hasattr(model.net, 'accel_head')` branch in the training loop calls `accel_distillation_loss(...)`, but the function was never imported anywhere in the file. This is not a design gap — it's a straightforward missing `import` — and it means any run using `AccelFlow` (§3) would hit a `NameError` on the very first training step. Fixed with:
+```python
+from model_oldRepo.accel_flow import accel_distillation_loss
+```
+(adjust the module path if `accel_flow.py` doesn't live at `model_oldRepo/accel_flow.py` in your checkout).
+
+### 9.2 Per-step log line referenced an undefined `step_timestep`
+The periodic training-progress log line referenced `step_timestep`, a variable that only exists in the **validation** loop further down — the training loop was never updated after moving from a single-timestep-per-item design to the current multi-interior-frame one (`timesteps_list`, one item now carrying `num_interior` timesteps at once, per `forward_multi_t`). This guarantees a `NameError` the first time `global_step % LOG_EVERY_STEPS == 0` fires, i.e. very early into any run. Fixed by reporting the item's actual timestep range instead of a single (nonexistent) scalar:
+```python
+t_lo, t_hi = min(timesteps_list), max(timesteps_list)
+...
+f't_range [{t_lo:.3f},{t_hi:.3f}] n={num_interior} | ...'
+```
+
+### 9.3 `val_loss` silently scored on padded pixels; PSNR didn't
+`dataset.py`'s `_to_padded_tensor` (used for `img0`, `img1`, **and** `gt`, in both train and val) replicate-pads every tensor up to `PAD_MULTIPLE` — so the `gt` reaching `train.py`'s validation loop is on a padded canvas, not each sample's true `(h, w)`. The PSNR branch already cropped `pred`/`gt` to the sample's true resolution before scoring (`pred_cropped`/`gt_cropped`), but `val_loss += criterion(pred, gt).item()` ran on the full padded tensors *before* that crop ever happened — so on the exact same validation batch, `val_loss` and PSNR were being computed over different pixel counts, with `val_loss` silently including the replicate-padded border.
+
+Fixed by moving the crop earlier and sharing it between both metrics — the loss is now computed per-sample on `pred_cropped`/`gt_cropped`, then averaged over the batch, in the same loop that already existed for PSNR (bucketed `val.validation_batch_size > 1` batches, where different samples can have different true resolutions even after padding, needed this per-sample loop for PSNR already; `val_loss` was the one metric that hadn't caught up to it):
+```python
+batch_loss = 0.0
+for bi in range(b):
+    hi = int(h[bi].item()) if b > 1 else h0
+    wi = int(w[bi].item()) if b > 1 else w0
+    pred_cropped = pred[bi:bi + 1, :, :hi, :wi]
+    gt_cropped = gt[bi:bi + 1, :, :hi, :wi]
+    batch_loss += criterion(pred_cropped, gt_cropped).item()
+    if do_psnr_this_sample:
+        psnr_total += psnr(pred_cropped, gt_cropped)
+        psnr_count += 1
+val_loss += batch_loss / b
+```
+**Note for anyone comparing runs across this fix:** `val_loss` values from before and after this change are not directly comparable — the padded-border contribution the old code was silently including is now gone, so expect a one-time discontinuity in logged `val_loss` at the point a run switches to the fixed version, not a sign of a new problem.

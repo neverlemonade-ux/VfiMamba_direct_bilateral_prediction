@@ -90,6 +90,21 @@ accel loss's TEACHER pass (real flow to the real middle frame) always
 uses full local refinement internally regardless, since it's a no_grad
 target computation and a better-refined target is strictly better
 supervision.
+
+NOTE ON ACCEL-LOSS COST: accel_distillation_loss recomputes
+estimate_bi_flow (student pass) AND a second no_grad estimate_bi_flow
+(teacher pass) from scratch for EVERY interior frame in the item, since
+it's called once per i in range(num_interior) below. Unlike the
+photometric branch -- which gets its one-backbone-pass amortization via
+forward_multi_t -- the accel branch pays for estimate_bi_flow 2x
+num_interior times per item (up to 2x10=20x at phase 4's max
+num_interior). This is a real inefficiency, not a correctness bug: the
+teacher pass can't be shared across interior frames anyway (it depends
+on gt[:, i], a different privileged frame per i), and only the student
+D/a computation is theoretically shareable. Left as-is here since it's a
+throughput concern, not a correctness one -- inline estimate_bi_flow/
+accel_head once yourself and reuse D/a across solve_accel_target calls
+if profiling shows this is actually your bottleneck.
 """
 import argparse
 import math
@@ -107,6 +122,7 @@ import resolution
 from Trainer import Model, convert  # noqa: E402
 from model_oldRepo import warplayer
 from model_oldRepo.loss import LapLoss
+from model_oldRepo.accel_flow import accel_distillation_loss  # used below when model.net has accel_head
 import configCustom
 sys.modules['config'] = configCustom  # Trainer.py does `from config import *`
 from configCustom import MODEL_CONFIG  # noqa: E402
@@ -305,36 +321,26 @@ def main(cfg, run_cfg, phase, restore_ckpt=None):
 
         log(f'-- epoch {epoch+1}/{EPOCHS} starting | lr {cur_lr:.2e} | {n_steps} steps/epoch')
 
-        for step, (img0, gt, img1, timestep, h, w, batch_uid, window_id, window_num_items) in enumerate(train_loader):
-            batch_uid = batch_uid[0]  # DataLoader wraps single strings/ints in a list at batch_size=1
+        for step, (img0, gt, img1, timesteps, h, w, batch_uid, window_id, window_num_items) in enumerate(train_loader):
+            batch_uid = batch_uid[0]
             window_id = window_id[0]
             window_num_items = int(window_num_items.item())
 
             img0 = img0.cuda(non_blocking=True)
-            gt = gt.cuda(non_blocking=True)
+            gt = gt.cuda(non_blocking=True)          # (1, num_interior, C, H, W)
             img1 = img1.cuda(non_blocking=True)
             imgs = torch.cat((img0, img1), 1)
 
-            step_timestep = float(timestep.item())
+            timesteps_list = timesteps[0].tolist()    # num_interior floats
+            num_interior = len(timesteps_list)
             h, w = int(h.item()), int(w.item())
             long_edge = max(h, w)
             epoch_res_counts[(w, h)] += 1
 
-            # Still resolved per-item -- used for train_scale and for the
-            # log line's "what a full window here would look like"
-            # context, but no longer the source of the accumulation
-            # target or the loss divisor (window_num_items, read straight
-            # off disk via dataset.py, is exact for both full and
-            # partial windows -- see this module's docstring).
             batch_size_here, accum_here = resolution.resolve_dynamic_batch(
                 w, h, DYNAMIC_BATCH_THRESHOLDS, PAD_MULTIPLE)
             item_effective_batch = batch_size_here * accum_here
 
-            # window_id is the direct, authoritative boundary signal --
-            # curriculum_builder.py guarantees it changes exactly at
-            # accumulation-window boundaries (own->replay, replay->replay,
-            # full-window->trailing-partial-window) and never inside one.
-            # Flush FIRST, using whatever accumulated so far.
             if steps_since_update > 0 and window_id != cur_window_id:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.net.parameters(), GRAD_CLIP)
@@ -345,11 +351,6 @@ def main(cfg, run_cfg, phase, restore_ckpt=None):
                 cur_effective_batch = None
                 cur_window_id = None
 
-            # Lock the window's divisor to its TRUE item count on the
-            # first item of a new window -- exact for both full windows
-            # (equals batch_size(resolution)*accum_steps(resolution)) and
-            # partial windows (whatever smaller count actually landed
-            # there), so no separate "ratio" calculation is needed.
             if steps_since_update == 0:
                 cur_effective_batch = window_num_items
                 cur_window_id = window_id
@@ -357,24 +358,28 @@ def main(cfg, run_cfg, phase, restore_ckpt=None):
                     epoch_partial_windows_seen.add(window_id)
 
             step_scale = resolution.resolve_train_scale(w, h, TRAIN_SCALE_ANCHORS, PAD_MULTIPLE)
-
-            cur_lr = lr_schedule(optimizer, global_step, steps_per_epoch,
-                                  EPOCHS, WARMUP_EPOCHS, LR, MIN_LR)
+            cur_lr = lr_schedule(optimizer, global_step, steps_per_epoch, EPOCHS, WARMUP_EPOCHS, LR, MIN_LR)
 
             with torch.cuda.amp.autocast(enabled=AMP):
-                _, _, _, pred = model.net(imgs, timestep=step_timestep, scale=step_scale, local=local)
-                loss = criterion(pred, gt)
-                if hasattr(model.net, 'accel_head'):  # AccelFlow only; no-op for plain flow_estimation.py
-                    from model_oldRepo.accel_flow import accel_distillation_loss
-                    loss = loss + W_ACCEL * accel_distillation_loss(
-                        model.net, img0, gt, img1, step_timestep, local=local)
-                    # local=local (NOT hardcoded): accel_head is a shared module
-                    # also invoked inside model.net's main forward above using this
-                    # same `local` setting -- passing it through here keeps
-                    # accel_head's student-side D consistent between the
-                    # photometric branch and the accel-supervision branch, instead
-                    # of silently training it against a different (unrefined)
-                    # input distribution than it will see at inference.
+                # Backbone (+ scale downsample/upsample bookkeeping) runs ONCE for
+                # this img0/img1 pair, regardless of num_interior -- this is the
+                # whole point of the doc2/doc4 architecture. Requires model.net to
+                # be a MultiScaleFlow/AccelFlow-style model (has forward_multi_t);
+                # this training loop is no longer compatible with the original
+                # per-timestep-regression architecture.
+                preds = model.net.forward_multi_t(imgs, timesteps_list, local=local, scale=step_scale)
+                frame_losses = [criterion(preds[i], gt[:, i]) for i in range(num_interior)]
+                loss = torch.stack(frame_losses).mean()   # mean across interior frames, NOT sum --
+                                                            # keeps one item's gradient weight independent
+                                                            # of how many interior frames it happened to have
+
+                if hasattr(model.net, 'accel_head'):
+                    accel_losses = []
+                    for i in range(num_interior):
+                        accel_losses.append(accel_distillation_loss(
+                            model.net, img0, gt[:, i], img1, timesteps_list[i], local=local))
+                    loss = loss + W_ACCEL * torch.stack(accel_losses).mean()
+
                 loss = loss / cur_effective_batch
 
             scaler.scale(loss).backward()
@@ -403,10 +408,17 @@ def main(cfg, run_cfg, phase, restore_ckpt=None):
                 avg_step_time = elapsed_total / global_step
                 eta = avg_step_time * (total_steps_all - global_step)
                 running_avg_loss = running_loss / (step + 1)
+                # NOTE: this used to reference a single `step_timestep`, which was
+                # never defined in the TRAIN loop (only in the val loop below) --
+                # that was a guaranteed NameError on the first log tick, since a
+                # train item now carries a *list* of interior timesteps
+                # (timesteps_list), not one scalar. Report the range + count
+                # instead of a single value.
+                t_lo, t_hi = min(timesteps_list), max(timesteps_list)
                 log(f'  epoch {epoch+1}/{EPOCHS} | step {step+1}/{n_steps} '
                     f'(global {global_step}/{total_steps_all}) | res {w}x{h} (long edge {long_edge}px) | '
                     f'loss {step_loss:.4f} | avg_loss {running_avg_loss:.4f} | lr {cur_lr:.2e} | '
-                    f't {step_timestep:.3f} | scale {step_scale:.3f} | '
+                    f't_range [{t_lo:.3f},{t_hi:.3f}] n={num_interior} | scale {step_scale:.3f} | '
                     f'window={window_id} window_items={cur_effective_batch}/{item_effective_batch} '
                     f'({100*cur_effective_batch/item_effective_batch:.0f}% full) | '
                     f'src_batch={os.path.basename(batch_uid)} | '

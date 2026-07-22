@@ -4,7 +4,7 @@
 # every tunable. Edit this file, not the .py files, to retune the pipeline.
 # =============================================================================
 
-seed: 42   # THE global seed. Every random operation anywhere in the pipeline
+seed: 1   # THE global seed. Every random operation anywhere in the pipeline
            # (train/val split, replay selection, replay export destination,
            # dataset ordering, per-item timestep choice) derives its own
            # independent-but-reproducible sub-seed from this ONE value via
@@ -32,13 +32,16 @@ pad_multiple: 32
 image_extensions: [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"]
 
 data:
-data:
-  # Base frame names (NO extension). Order = temporal order.
-  # img0 = first present, img1 = last present, gt = a randomly-chosen
-  # (seeded) interior frame during training.
   frame_names: ["frame1", "frame2", "frame3"]
   flip_aug: false
-  val_max_interior_per_seq: 4
+  val_max_interior_per_seq: 10
+  # Cap on how many frames apart img0<->img1 can be within a phase, for
+  # scenes that are longer than this. Omit a phase (or use null) for no cap.
+  max_frame_span_by_phase:
+    1: 5
+    2: 7
+    3: 8
+    4: 10
 
 # Tried in this order for EVERY frame_name, per scene, independently.
 # First existing extension wins -- lets different datasets under the same
@@ -67,8 +70,8 @@ curriculum:
   # max_long_side) whose threshold is >= the sample's long edge wins.
   phase_buckets:
     - {max_long_side: 1000,  phase: 1}
-    - {max_long_side: 1920,  phase: 2}
-    - {max_long_side: 2560,  phase: 3}
+    - {max_long_side: 1280,  phase: 2}
+    - {max_long_side: 1536,  phase: 3}
     - {max_long_side: .inf,  phase: 4}
 
 # Dynamic batch_size / accum_steps by resolution, looked up the same way
@@ -82,12 +85,15 @@ curriculum:
 # never invents its own resolution->batch_size mapping.
 dynamic_batch:
   thresholds:
-  - {max_long_side: 640,  batch_size: 10, accum_steps: 1}
-  - {max_long_side: 1280, batch_size: 5,  accum_steps: 2}
-  - {max_long_side: 1920, batch_size: 3,  accum_steps: 4}
-  - {max_long_side: 2560, batch_size: 2,  accum_steps: 5}
-  - {max_long_side: 3840, batch_size: 1,  accum_steps: 10}
-  - {max_long_side: .inf, batch_size: 1,  accum_steps: 10}
+  - {max_long_side: 128,  batch_size: 64, accum_steps: 1}
+  - {max_long_side: 256, batch_size: 16, accum_steps: 4}
+  - {max_long_side: 320, batch_size: 8,  accum_steps: 8}
+  - {max_long_side: 426, batch_size: 8,  accum_steps: 8}
+  - {max_long_side: 640, batch_size: 4,  accum_steps: 16}
+  - {max_long_side: 720, batch_size: 2,  accum_steps: 32}
+  - {max_long_side: 1280, batch_size: 1,  accum_steps: 64}
+  - {max_long_side: .inf, batch_size: 1,  accum_steps: 64}
+  
 
 # Flow-estimation train_scale, smoothly interpolated (piecewise-linear)
 # between anchors instead of stepping abruptly at bucket edges. Long
