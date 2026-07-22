@@ -49,15 +49,46 @@ input_root with a different crop_size each time; since output names are
 disambiguated by size, all runs can safely share the same output_root.
 
 === DYNAMIC CROP COUNT / PLACEMENT ===
-Unchanged from the original combined script: for a scene of size (w, h)
-and the configured crop_size (crop_w, crop_h),
+For a scene of size (w, h) and the configured crop_size (crop_w, crop_h),
+the GEOMETRIC tile-fit count is:
 
-    num_crops = min(w // crop_w, h // crop_h)
+    geometric_n = min(w // crop_w, h // crop_h)
 
 optionally capped by crop.max_crops_per_scene. The valid placement
 region is partitioned into a grid with >= num_crops cells, shuffled
 (seeded), and one distinct cell is assigned per crop so crop boxes can
 never coincide. See compute_num_crops / compute_crop_boxes.
+
+On top of that geometric count, crop.min_headroom_ratio (default 1.0,
+i.e. no effect) guards against a scene that technically fits several
+crop_size tiles but only barely -- e.g. a scene at 1.2x crop_size in its
+tighter dimension still geometrically fits 1 tile per axis and produces
+a "num_crops" from the formula above, but a scene only marginally bigger
+than crop_size doesn't have much real headroom for crops to differ from
+one another in content even when their boxes are geometrically
+non-overlapping (see MOTION GATE below for one axis of that; this knob
+addresses a different one -- see MIN HEADROOM RATIO below). When a
+scene's headroom_ratio = min(w/crop_w, h/crop_h) falls below
+min_headroom_ratio, num_crops is capped to 1 regardless of what the
+geometric formula alone would have produced. Scenes at or above the
+threshold are completely unaffected -- this only ever REDUCES crop
+count, never increases it beyond the geometric max.
+
+=== MIN HEADROOM RATIO -- WHY ===
+Two crops from a scene with abundant headroom above crop_size (say, a
+4K source at crop_size=256) genuinely sample different content -- lots
+of room for the grid-cell placement to land on meaningfully distinct
+parts of the frame. Two crops from a scene only slightly bigger than
+crop_size don't have that luxury: even placed in different grid cells,
+both crops necessarily cover most of the same frame, differing mainly
+in a thin border strip -- near-duplicate training examples that inflate
+dataset size without adding real variety. crop.min_headroom_ratio lets
+you say "don't bother taking more than 1 crop from a scene until it's
+at least this many multiples of crop_size in its tighter dimension."
+headroom_ratio is computed once per scene (min(w/crop_w, h/crop_h)) and
+is written to manifest.jsonl per output folder (resolution_headroom_ratio)
+regardless of whether the cap actually applied, for traceability -- see
+compute_num_crops.
 
 === MOTION GATE -- WHY ===
 A crop box chosen purely by grid position can easily land on a static
@@ -149,10 +180,10 @@ source (000000.png, 000001.png, ...) for whichever slice of indices
 [start:start+length) it covers -- nothing is renumbered.
 
 A manifest.jsonl is written to output_root recording, per output folder:
-source scene, crop box, source resolution, full-scene frame count,
-sweep schedule, window start/end, this variant's frame count, motion
-score, and reroll attempts used -- the same "durable, browsable record"
-convention as the rest of this pipeline.
+source scene, crop box, source resolution, resolution_headroom_ratio,
+full-scene frame count, sweep schedule, window start/end, this variant's
+frame count, motion score, and reroll attempts used -- the same
+"durable, browsable record" convention as the rest of this pipeline.
 
 === ASSUMPTIONS WORTH KNOWING ABOUT ===
 - Frame numbering is contiguous from data.frame_index_start (see INPUT
@@ -164,6 +195,11 @@ convention as the rest of this pipeline.
 - Only one crop size is active per run (see ONE CROP SIZE PER RUN
   above); run the script again with a different crop.crop_size (and the
   same output_root) to build out a size ladder.
+- crop.min_headroom_ratio only ever caps DOWN to 1 crop -- it never
+  increases crop count beyond the geometric formula, and a
+  min_headroom_ratio <= 1.0 (the default) has no effect at all, since
+  headroom_ratio is always >= 1.0 for any scene that passes the
+  w < crop_w / h < crop_h size check. See MIN HEADROOM RATIO above.
 - The per-step trim fraction is `reduction_pct * (1 + accel_rate) **
   step`, applied to the CURRENT window's length at that step -- each
   step trims a bigger percentage than the last, not a constant amount.
@@ -189,7 +225,7 @@ import cv2
 import numpy as np
 import yaml
 
-from training.seeding import seed_everything  # reuse -- one seeding implementation, not two
+from dataset import seed_everything  # reuse -- one seeding implementation, not two
 
 
 # ============================================================
@@ -207,18 +243,46 @@ def _scene_rng(seed, scene_index, crop_w, crop_h):
 
 
 # ============================================================
-# 2. DYNAMIC CROP-BOX COMPUTATION (unchanged logic from the original
-#    combined script -- kept here since cropping is now this script's
-#    sole responsibility)
+# 2. DYNAMIC CROP-BOX COMPUTATION
 # ============================================================
 
-def compute_num_crops(w, h, crop_w, crop_h, max_crops=None):
+def compute_num_crops(w, h, crop_w, crop_h, max_crops=None, min_headroom_ratio=1.0):
+    """
+    Returns (num_crops, headroom_ratio, headroom_capped).
+
+    num_crops: the GEOMETRIC tile-fit count, min(w // crop_w, h // crop_h)
+    -- how many non-overlapping crop_size tiles fit across the scene's
+    tighter dimension -- optionally capped by `max_crops` and then,
+    separately, capped to 1 if headroom_ratio < min_headroom_ratio (see
+    module docstring, MIN HEADROOM RATIO). Neither cap can ever increase
+    num_crops above the geometric count.
+
+    headroom_ratio: min(w / crop_w, h / crop_h) -- a continuous (not
+    floor-divided) measure of how many multiples of crop_size this
+    scene spans in its tighter dimension. Always computed and returned
+    (0.0 if the scene is smaller than crop_size in either dimension) so
+    callers can log/record it regardless of whether it ended up
+    triggering the min_headroom_ratio cap.
+
+    headroom_capped: True only if min_headroom_ratio actually reduced
+    num_crops below what the geometric formula (post max_crops) would
+    otherwise have produced -- i.e. False when the geometric count was
+    already <= 1, since nothing was actually capped in that case.
+    """
     if w < crop_w or h < crop_h:
-        return 0
+        return 0, 0.0, False
+
+    headroom_ratio = min(w / crop_w, h / crop_h)
     n = min(w // crop_w, h // crop_h)
     if max_crops is not None:
         n = min(n, max_crops)
-    return max(0, n)
+
+    headroom_capped = False
+    if headroom_ratio < min_headroom_ratio and n > 1:
+        n = 1
+        headroom_capped = True
+
+    return max(0, n), headroom_ratio, headroom_capped
 
 
 def compute_crop_boxes(w, h, crop_w, crop_h, num_crops, jitter, rng):
@@ -517,7 +581,7 @@ def variant_output_name(base_name, start, length, total_frames, sweep_tag=None):
 # ============================================================
 
 def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
-                   max_crops_per_scene, jitter, motion_cfg, seq_cfg,
+                   max_crops_per_scene, min_headroom_ratio, jitter, motion_cfg, seq_cfg,
                    output_root, seed, scene_index, overwrite, log):
     """
     Crops one source scene (0..num_crops crop boxes at the single
@@ -551,11 +615,16 @@ def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
                 f'scene must share a resolution')
             return []
 
-    num_crops = compute_num_crops(w, h, crop_w, crop_h, max_crops_per_scene)
+    num_crops, headroom_ratio, headroom_capped = compute_num_crops(
+        w, h, crop_w, crop_h, max_crops_per_scene, min_headroom_ratio)
     if num_crops == 0:
         log(f'  [skip] {scene_name}: {w}x{h} is smaller than crop size '
             f'{crop_w}x{crop_h} in at least one dimension')
         return []
+    if headroom_capped:
+        log(f'  [headroom] {scene_name}: {w}x{h} has only {headroom_ratio:.2f}x '
+            f'headroom over crop size {crop_w}x{crop_h} (< min_headroom_ratio='
+            f'{min_headroom_ratio}) -- capped to 1 crop instead of the geometric max')
 
     # Run all configured sweep schedules and merge, deduping any window
     # (start, end) pair produced by more than one schedule -- mainly the
@@ -635,6 +704,8 @@ def process_scene(scene_name, seq_dir, data_cfg, crop_w, crop_h,
                 'crop_size': {'w': crop_w, 'h': crop_h},
                 'crop_box': {'x': x, 'y': y, 'w': crop_w, 'h': crop_h},
                 'source_resolution': {'w': w, 'h': h},
+                'resolution_headroom_ratio': round(headroom_ratio, 3),
+                'headroom_capped': headroom_capped,
                 'source_total_frames': total_frames,
                 'sweep_schedule': tag or 'full',
                 'window_start': wstart,
@@ -670,6 +741,7 @@ def crop_dataset(C, log=print):
     else:
         crop_w = crop_h = int(crop_size)
     max_crops_per_scene = c_cfg.get('max_crops_per_scene')
+    min_headroom_ratio = c_cfg.get('min_headroom_ratio', 1.0)
     jitter = c_cfg.get('jitter', True)
 
     # Default output_root now carries the active crop size (e.g.
@@ -696,7 +768,7 @@ def crop_dataset(C, log=print):
     )
     log(f'cropping {len(scenes)} scene(s) from {input_root}')
     log(f'  crop_size={_size_str(crop_w, crop_h)}  max_crops_per_scene={max_crops_per_scene}  '
-        f'jitter={jitter}  seed={seed}')
+        f'min_headroom_ratio={min_headroom_ratio}  jitter={jitter}  seed={seed}')
     log(f'  frame naming: start={d_cfg.get("frame_index_start", 0)} '
         f'digits={d_cfg.get("frame_index_digits", 6)} '
         f'extensions={d_cfg.get("frame_extensions", ["png","jpg","jpeg","bmp","tif","tiff"])}')
@@ -719,7 +791,7 @@ def crop_dataset(C, log=print):
             seq_dir = os.path.join(input_root, scene_name)
             entries = process_scene(
                 scene_name, seq_dir, d_cfg, crop_w, crop_h,
-                max_crops_per_scene, jitter, motion_cfg, seq_cfg,
+                max_crops_per_scene, min_headroom_ratio, jitter, motion_cfg, seq_cfg,
                 output_root, seed, scene_index, overwrite, log)
             for entry in entries:
                 mf.write(json.dumps(entry) + '\n')
