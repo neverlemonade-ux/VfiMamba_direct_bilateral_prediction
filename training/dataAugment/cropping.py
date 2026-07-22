@@ -189,7 +189,7 @@ import cv2
 import numpy as np
 import yaml
 
-from dataset import seed_everything  # reuse -- one seeding implementation, not two
+from training.seeding import seed_everything  # reuse -- one seeding implementation, not two
 
 
 # ============================================================

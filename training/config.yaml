@@ -4,7 +4,7 @@
 # every tunable. Edit this file, not the .py files, to retune the pipeline.
 # =============================================================================
 
-seed: 1   # THE global seed. Every random operation anywhere in the pipeline
+seed: 42   # THE global seed. Every random operation anywhere in the pipeline
            # (train/val split, replay selection, replay export destination,
            # dataset ordering, per-item timestep choice) derives its own
            # independent-but-reproducible sub-seed from this ONE value via

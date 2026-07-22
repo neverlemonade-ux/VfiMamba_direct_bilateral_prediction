@@ -89,5 +89,5 @@ sequence:
   min_output_frames: 3          # never write a variant shorter than this, even if the arithmetic
                                  # would otherwise produce one
 
-seed: 1                          # governs crop placement AND motion-gate rerolls; reruns with the
+seed: 42                          # governs crop placement AND motion-gate rerolls; reruns with the
                                  # same seed against the same input_root reproduce identical output
