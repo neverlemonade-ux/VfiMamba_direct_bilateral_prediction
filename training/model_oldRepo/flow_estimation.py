@@ -374,8 +374,19 @@ class MultiScaleFlow(nn.Module):
         `flow_from_bi` + `mask_from_visibility` + `synthesize` steps
         repeat per t.
 
-        timesteps: iterable of floats in (0, 1).
-        Returns: list of predicted frames, one per timestep.
+        timesteps: EITHER
+        - a (B, T_max) tensor (train.py's batched path, one
+            timestep column per interior-frame slot, potentially
+            different per sample b) -- this is what
+            dataset.ragged_collate / train.py's training loop produce.
+        - a plain iterable of python floats, one t shared across the
+            WHOLE batch (Trainer.py's inference_multi_t calling
+            convention, unaffected by the batching revision) -- each
+            entry is broadcast to every sample the same way `forward()`
+            already does.
+
+        Returns: list of predicted frames. Length T_max (batched path)
+        or len(timesteps) (legacy path); each entry is (B, C, H, W).
         """
         if scale > 0:
             x_o = x
@@ -392,10 +403,25 @@ class MultiScaleFlow(nn.Module):
             visibility = F.interpolate(visibility, scale_factor=up, mode="bilinear", align_corners=False)
 
         preds = []
-        for ts in timesteps:
-            t = (img0[:, :1].clone() * 0 + 1) * float(ts)
-            flow_t = self.flow_from_bi(bi_flow, t)
-            mask_t = self.mask_from_visibility(visibility, t)
-            pred, _, _, _ = self.synthesize(img0, img1, af, flow_t, mask_t)
-            preds.append(pred)
+        if torch.is_tensor(timesteps) and timesteps.dim() == 2:
+            # Batched path: timesteps is (B, T_max), one column per interior
+            # slot, potentially a different t per sample. Loop over T_max
+            # (time), not B (batch) -- each iteration handles the WHOLE
+            # batch's slot i in one call.
+            B, T_max = timesteps.shape
+            for i in range(T_max):
+                t = timesteps[:, i].view(B, 1, 1, 1).to(img0.dtype)
+                flow_t = self.flow_from_bi(bi_flow, t)
+                mask_t = self.mask_from_visibility(visibility, t)
+                pred, _, _, _ = self.synthesize(img0, img1, af, flow_t, mask_t)
+                preds.append(pred)
+        else:
+            # Legacy path: plain iterable of python floats, one t shared by
+            # the whole batch per call -- unchanged from before this revision.
+            for ts in timesteps:
+                t = (img0[:, :1].clone() * 0 + 1) * float(ts)
+                flow_t = self.flow_from_bi(bi_flow, t)
+                mask_t = self.mask_from_visibility(visibility, t)
+                pred, _, _, _ = self.synthesize(img0, img1, af, flow_t, mask_t)
+                preds.append(pred)
         return preds

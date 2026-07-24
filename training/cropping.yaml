@@ -3,7 +3,7 @@
 # variant config.
 #
 # Run with:
-#   python cropping.py --config cropping_config.yaml
+#   python cropping.py --config cropping.yaml
 #
 # This is STAGE 1 of the pipeline. Point augmentation.py's data.data_root
 # at THIS script's output_root below to run pixel augmentation as a
@@ -12,9 +12,9 @@
 
 # input_root and output_root live right here at the top, as requested:
 data:
-  input_root: /mnt/d/trainingData/train_10k      # folder containing one subfolder per scene,
+  input_root: "E:/vfi_database/vfi_database/MovieTrainingData/Alita_Battle_Angel"      # folder containing one subfolder per scene,
                                                     # each subfolder full of that scene's frames
-  output_root: null                                # null -> defaults to "<input_root>_cropped_<size>"
+  output_root: "D:/AllTrainingData"                                # null -> defaults to "<input_root>_cropped_<size>"
                                                     # (sibling folder, never inside input_root),
                                                     # where <size> is this run's crop.crop_size, e.g.
                                                     # "train_10k_cropped_128" or
@@ -49,7 +49,7 @@ crop:
   # 640x480, 720x480), run this script once per size against the same
   # input_root, pointing output_root at the same place each time; sizes
   # never collide in the output naming.
-  crop_size: 128
+  crop_size: 512
 
   max_crops_per_scene: null      # optional cap on the dynamically computed crop count
                                  # (num_crops = min(w // crop_w, h // crop_h)). null = uncapped.

@@ -29,7 +29,6 @@ paths:
   dataset_root: "D:/vifmamba/PhasesData"
 
 pad_multiple: 32
-image_extensions: [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"]
 
 data:
   frame_names: ["frame1", "frame2", "frame3"]

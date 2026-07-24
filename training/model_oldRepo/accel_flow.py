@@ -210,9 +210,17 @@ class AccelFlow(MultiScaleFlow):
     # ------------------------------------------------------------------
     def forward_multi_t(self, x, timesteps, local=False, scale=0):
         """
-        timesteps: iterable of floats in (0, 1) -- any intermediate
-        frame position(s), not restricted to 0.5 or any fixed grid.
-        Returns: list of predicted frames, one per timestep.
+        timesteps: EITHER a (B, T_max) tensor (train.py's batched path,
+        potentially a different t per sample per slot) OR a plain iterable
+        of python floats shared across the whole batch (legacy path, used
+        by Trainer.py's inference_multi_t). See MultiScaleFlow.forward_multi_t
+        for the same distinction -- this override exists purely so the
+        acceleration term (D, a) is actually used per t via
+        flow_from_bi_accel instead of silently falling back to the
+        linear-only flow_from_bi inherited from the base class.
+
+        Returns: list of predicted frames, length T_max (batched path) or
+        len(timesteps) (legacy path); each entry is (B, C, H, W).
         """
         if scale > 0:
             x_o = x
@@ -232,12 +240,21 @@ class AccelFlow(MultiScaleFlow):
         a = self.accel_head(img0, img1, D)  # computed ONCE, reused for every requested t below
 
         preds = []
-        for ts in timesteps:
-            t = (img0[:, :1].clone() * 0 + 1) * float(ts)
-            flow_t = self.flow_from_bi_accel(D, a, t)
-            mask_t = self.mask_from_visibility(visibility, t)
-            pred, _, _, _ = self.synthesize(img0, img1, af, flow_t, mask_t)
-            preds.append(pred)
+        if torch.is_tensor(timesteps) and timesteps.dim() == 2:
+            B, T_max = timesteps.shape
+            for i in range(T_max):
+                t = timesteps[:, i].view(B, 1, 1, 1).to(img0.dtype)
+                flow_t = self.flow_from_bi_accel(D, a, t)
+                mask_t = self.mask_from_visibility(visibility, t)
+                pred, _, _, _ = self.synthesize(img0, img1, af, flow_t, mask_t)
+                preds.append(pred)
+        else:
+            for ts in timesteps:
+                t = (img0[:, :1].clone() * 0 + 1) * float(ts)
+                flow_t = self.flow_from_bi_accel(D, a, t)
+                mask_t = self.mask_from_visibility(visibility, t)
+                pred, _, _, _ = self.synthesize(img0, img1, af, flow_t, mask_t)
+                preds.append(pred)
         return preds
 
     # ------------------------------------------------------------------

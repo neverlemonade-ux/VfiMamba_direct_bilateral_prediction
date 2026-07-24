@@ -8,6 +8,51 @@ a random interior-frame/timestep pick per training item. Also loads
 ValidationData/, unbatched, with every interior frame of every val
 sequence enumerated once.
 
+> **Revision note (this revision -- real batch loading via BatchUidGroupedSampler):**
+> Previously this file only ever produced single-item Datasets and train.py
+> forced DataLoader(batch_size=1), implementing "dynamic batch size" purely
+> as gradient accumulation over singles. That left GPU utilization on the
+> table at low resolutions (Phase 1/2), where a single native-res forward
+> pass often doesn't saturate the GPU and per-call overhead (kernel launch,
+> autocast setup, cudnn algorithm selection) becomes a real fraction of
+> step time.
+>
+> This revision adds `BatchUidGroupedSampler` and `ragged_collate`, which
+> together let train.py load a REAL minibatch -- one physical
+> `BatchNNN_<res>/` folder's worth of scenes at once -- onto the GPU in a
+> single forward call, while changing nothing about which batches exist,
+> how they're ordered, or how accumulation windows are formed (all of that
+> is still curriculum_builder.py's job, untouched by this revision).
+>
+> Two things make this safe:
+>   1. Every scene inside one `BatchNNN_<res>/` folder shares EXACTLY one
+>      padded resolution by construction (see curriculum_builder.py's
+>      group_into_batches docstring) -- so a batch_uid-grouped minibatch
+>      never needs cross-resolution padding/cropping, only stacking.
+>   2. Scenes within one batch_uid group can still have DIFFERING interior-
+>      frame counts (a scene's frame count depends on max_frame_span
+>      sub-clipping, which is per-scene, not per-resolution) -- so
+>      `ragged_collate` pads gt/timesteps to this minibatch's own
+>      T_max = max(num_interior) and returns a `valid_mask` (B, T_max)
+>      bool tensor, which train.py's masked loss uses to make sure a
+>      shorter-scene item's per-item loss weight stays independent of how
+>      many interior frames it happened to have -- exactly the same
+>      invariant the old single-item `frame_losses.mean()` already
+>      preserved, just now computed per-item-then-across-batch instead of
+>      per-item-then-across-steps.
+>
+> At high resolutions (Phase 3/4), if config.yaml's dynamic_batch table
+> already resolves `batch_size=1` for those thresholds, a batch_uid group
+> naturally contains exactly one scene -- this file's loading behavior
+> degrades to the old one-item-at-a-time path automatically, with no
+> phase-conditional branching needed anywhere. What changes phase to phase
+> is purely the config table, not this code.
+>
+> `Extra/` is still skipped entirely (see _PHASE_SKIP_ENTRIES below,
+> unchanged) -- it was never covered by accumulation windows and isn't
+> covered by batch-uid grouping either; nothing in this revision touches
+> that behavior.
+
 NOTE ON Extra/: curriculum_builder.py writes an Extra/ folder inside each
 Phase<N>/ for undersized batches (item count below the configured
 batch_size for their resolution). This file's directory walk
@@ -40,30 +85,84 @@ then scene names within each reproduces the exact curriculum order
 curriculum_builder.py computed. For val, order doesn't carry curriculum
 meaning, so alphabetical (dataset, then scene) is used.
 
-=== WHY TRAIN BATCHES ARE PROCESSED ONE ITEM AT A TIME, NOT STACKED ===
+=== WHY TRAIN ITEMS WITHIN ONE BATCH_UID GROUP CAN BE STACKED, BUT NOT
+    ACROSS BATCH_UID GROUPS ===
 The curriculum interleaves replay from earlier (lower-resolution) phases
 throughout each phase's own (higher-resolution) progression -- so
-consecutive items on disk can be different native resolutions by design
-(batch folders group RUNS of same-resolution items, not the whole phase --
-see curriculum_builder.py's module docstring). Stacking a physical batch
-> 1 across differing resolutions would require either cropping everyone
-to a common shape (destroys full-native-resolution training, the whole
-point of this pipeline) or trusting the underlying VFIMamba Trainer.Model
-to accept a per-sample timestep TENSOR for batch > 1 -- which the given
-Trainer.py/model_oldRepo code never demonstrates (every call site in the
-original train.py passed a single scalar timestep).
+consecutive BATCH FOLDERS on disk can be different native resolutions by
+design (batch folders group RUNS of same-resolution items, not the whole
+phase -- see curriculum_builder.py's module docstring). WITHIN one batch
+folder, however, every scene shares exactly one padded resolution by
+construction. `BatchUidGroupedSampler` (below) exploits exactly this:
+it groups dataset indices by batch_uid (== one physical BatchNNN_<res>/
+folder), so every minibatch train.py receives is single-resolution and
+can be stacked into a real (B, C, H, W) tensor with zero cropping or
+cross-resolution padding. Consecutive minibatches (i.e. consecutive
+batch_uid groups) can still differ in resolution from each other -- that
+is unchanged and is exactly what train.py's cudnn.benchmark=False,
+per-step resolution.resolve_dynamic_batch() lookup, and window_id-based
+(not batch_uid-based) accumulation flushing are already built to handle.
 
-So this pipeline keeps DataLoader batch_size=1 (one sequence, its own
-native resolution, per physical step) and implements "dynamic batch_size"
-and "dynamic grad accumulation" together as ONE micro-step counter in
-train.py: effective_batch = batch_size(resolution) * accum_steps(resolution),
-looked up per item via resolution.resolve_dynamic_batch(). This is
-mathematically identical to true batching for gradient-accumulation
-purposes (loss is additive across samples) and makes no assumption about
-the model's batching support -- and it agrees with what curriculum_builder.py
-already wrote into each batch folder's batch_metadata.yaml, since every
-item in a batch folder shares one resolution by construction. See
-train.py's training loop.
+=== WHY TRAIN BATCHES ARE PROCESSED VIA ragged_collate, NOT DEFAULT COLLATE ===
+Even within one batch_uid group (fixed resolution), scenes can have
+differing interior-frame counts (frame count depends on max_frame_span
+sub-clipping, a per-SCENE draw -- see "PER-PHASE MAX FRAME SPAN" below --
+not on resolution). Default collate can't stack ragged gt_stack
+(num_interior, C, H, W) tensors of differing num_interior across items in
+a batch. `ragged_collate` pads gt/timesteps to this minibatch's own
+T_max = max(num_interior over the group) and returns a `valid_mask`
+(B, T_max) bool tensor alongside everything else -- see that function's
+docstring, and train.py's masked-loss computation which consumes it.
+
+=== WHY THE UNDERLYING MODEL STILL USES DYNAMIC batch_size * accum_steps,
+    NOT A SINGLE FIXED PHYSICAL BATCH SIZE ===
+The curriculum interleaves replay from earlier (lower-resolution) phases
+throughout each phase's own (higher-resolution) progression, and
+config.yaml's dynamic_batch.thresholds table assigns a DIFFERENT
+batch_size/accum_steps pair per resolution bucket (small resolutions get
+a large batch_size and accum_steps=1; large resolutions get batch_size=1
+and a large accum_steps) specifically so that VRAM stays roughly constant
+across the curriculum despite native-resolution training. Consecutive
+batch_uid groups (== consecutive minibatches yielded by
+BatchUidGroupedSampler) can therefore have DIFFERING physical batch
+sizes B within one phase, and train.py's accumulation-window flushing
+(gated on window_id, not on B or resolution) is exactly the mechanism
+that makes mixing differing-B minibatches within one accumulation window
+mathematically correct -- see train.py's module docstring.
+
+=== WHY train_seq_dirs / val_seq_dirs still get walked one scene at a time ===
+The directory walk that discovers scenes (_list_train_seq_dirs) still
+returns one entry per scene, in curriculum order -- that part is
+unaffected by this revision. What changed is only how those flat items
+get GROUPED into DataLoader steps (BatchUidGroupedSampler, keyed on the
+batch_uid already present per item) and COLLATED once grouped
+(ragged_collate). If you ever want to go back to strict one-item-at-a-
+time loading (e.g. for debugging), just build a plain
+torch.utils.data.DataLoader(train_set, batch_size=1, shuffle=False, ...)
+against the same train_set -- __getitem__'s per-item return shape is
+unchanged, batch-of-1 default collate still works exactly as before.
+
+=== WHY TRAIN BATCHES ARE PROCESSED ONE RESOLUTION AT A TIME ===
+The curriculum interleaves replay from earlier (lower-resolution) phases
+throughout each phase's own (higher-resolution) progression -- so
+consecutive batch_uid GROUPS on disk can be different native resolutions
+by design (batch folders group RUNS of same-resolution items, not the
+whole phase -- see curriculum_builder.py's module docstring). Stacking
+ACROSS batch_uid groups into one bigger physical batch would require
+either cropping everyone to a common shape (destroys full-native-
+resolution training, the whole point of this pipeline) or trusting the
+underlying VFIMamba Trainer.Model to accept mixed-resolution tensors in
+one call, which it does not. So this pipeline keeps one physical batch
+per batch_uid group (single resolution, variable B), and implements
+"dynamic batch_size" and "dynamic grad accumulation" together as ONE
+micro-step counter in train.py: effective_batch = batch_size(resolution)
+* accum_steps(resolution), looked up per group via
+resolution.resolve_dynamic_batch(). This is mathematically identical to
+true batching for gradient-accumulation purposes (loss is additive
+across samples) and agrees with what curriculum_builder.py already wrote
+into each batch folder's batch_metadata.yaml, since every item in a
+batch folder shares one resolution by construction. See train.py's
+training loop.
 
 === ACCUMULATION WINDOWS: window_id / window_num_items ===
 curriculum_builder.py's group_batches_into_accum_windows() chunks each
@@ -72,20 +171,24 @@ usually SEVERAL consecutive batch folders of the same resolution, not
 one -- and stamps every batch in a window with a shared window_id plus
 the window's TRUE total item count (window_num_items). Both are read
 here straight out of each batch folder's batch_metadata.yaml (see
-_list_train_seq_dirs) and returned per item alongside batch_uid.
+_list_train_seq_dirs) and returned per item alongside batch_uid; since
+every item within one batch_uid group shares window_id/window_num_items
+identically (they're stamped per BATCH, not per scene), ragged_collate
+takes them from the group's first item without any risk of mismatch.
 
 batch_uid identifies which single physical BatchNNN_<res>/ folder an
-item came from and changes at every folder boundary -- including
-boundaries INSIDE one window -- so it is exposed here for
-traceability/logging only, same as before. window_id is the explicit,
-authoritative signal train.py flushes the optimizer on, and
-window_num_items is what train.py divides the accumulated loss by. Both
-full windows (exactly accum_steps(resolution) batches) and partial
-windows (a shorter trailing remainder of a resolution run, appended at
-the end of the phase's stream by curriculum_builder.py rather than
-discarded) carry these fields the same way -- train.py does not need to
-know or care which kind a given item's window is; window_num_items is
-already exact for either case. See train.py's training loop.
+item (and, as of this revision, an entire minibatch) came from and
+changes at every folder boundary -- including boundaries INSIDE one
+window -- so it is exposed here for traceability/logging only, same as
+before. window_id is the explicit, authoritative signal train.py flushes
+the optimizer on, and window_num_items is what train.py divides the
+accumulated loss by. Both full windows (exactly accum_steps(resolution)
+batches) and partial windows (a shorter trailing remainder of a
+resolution run, appended at the end of the phase's stream by
+curriculum_builder.py rather than discarded) carry these fields the same
+way -- train.py does not need to know or care which kind a given group's
+window is; window_num_items is already exact for either case. See
+train.py's training loop.
 
 === SEEDING: PER-EPOCH, NOT GLOBAL-RANDOM-STATE ===
 Each training item's interior-frame/timestep choice is drawn from a
@@ -97,7 +200,10 @@ the next (unlike drawing from Python's global `random` module, which
 worker_init_fn seeds once per worker and which would otherwise make every
 epoch repeat the same picks). train.py MUST call
 train_set.set_epoch(epoch) at the start of every epoch for this to work --
-see that file's training loop.
+see that file's training loop. This per-item seeding is unaffected by
+batch_uid grouping -- each scene's RNG is still keyed on its own
+sample_id, independent of which other scenes happen to land in the same
+minibatch.
 
 === PER-PHASE MAX FRAME SPAN (clip sampling for long scenes) ===
 Some source scenes run to hundreds or thousands of frames. Using a
@@ -119,12 +225,15 @@ one epoch to the next -- see set_epoch()) and runs the existing
 interior-frame/timestep selection on that clip instead of on the whole
 scene. img0/img1 become the clip's first/last frame, not the scene's.
 Scenes at or under the cap (or when max_frame_span is None for a phase)
-are unaffected and use the whole scene, exactly as before.
+are unaffected and use the whole scene, exactly as before. Because this
+draw is per-scene, two scenes in the same batch_uid group (same
+resolution) can still end up with different resulting num_interior --
+this is exactly the raggedness ragged_collate exists to handle.
 
 This is a per-item CLIP, not a train.py accumulation WINDOW -- window_id/
 window_num_items (see above) are a completely separate concept (gradient
-accumulation boundaries across many items) and are untouched by this
-feature; deliberately different terminology is used here to avoid
+accumulation boundaries across many minibatches) and are untouched by
+this feature; deliberately different terminology is used here to avoid
 confusion between the two.
 
 Validation is NOT clipped by this mechanism -- val always uses the full
@@ -181,13 +290,18 @@ def _list_train_seq_dirs(phase_dir):
 
     batch_uid is the batch folder's own path -- a natural, unique
     identifier for "which physical BatchNNN_<res>/ folder did this scene
-    come from," useful for logging/tracing an item back to its source
-    folder. Every scene sharing a batch_uid shares the same resolution by
-    construction (see curriculum_builder.py's group_into_batches), but
-    the reverse does NOT hold within one accumulation window:
-    curriculum_builder.py's group_batches_into_accum_windows() groups
-    several consecutive same-resolution batch folders into a single
-    window, so batch_uid can change multiple times WITHIN one window.
+    come from." As of this revision it does double duty: it's still used
+    for logging/tracing an item back to its source folder, AND it's the
+    grouping key BatchUidGroupedSampler uses to build real minibatches
+    (see that class below) -- every scene sharing a batch_uid shares the
+    same resolution by construction (see curriculum_builder.py's
+    group_into_batches), which is exactly what makes stacking them into
+    one (B, C, H, W) tensor safe. The reverse does NOT hold within one
+    accumulation window: curriculum_builder.py's
+    group_batches_into_accum_windows() groups several consecutive
+    same-resolution (or same-bucket) batch folders into a single window,
+    so batch_uid can change multiple times WITHIN one window -- i.e.
+    multiple minibatches can belong to the same window_id.
 
     window_id and window_num_items are read straight out of this batch
     folder's batch_metadata.yaml (written by curriculum_builder.py's
@@ -230,6 +344,9 @@ def _list_train_seq_dirs(phase_dir):
                     f'{scene_dir} has no matching entry in '
                     f'{batch_dir}/batch_metadata.yaml -- was this folder written '
                     f'by curriculum_builder.py?')
+            # batch_dir doubles as batch_uid -- unique per physical folder,
+            # stable across a run, and exactly the key BatchUidGroupedSampler
+            # groups on below.
             seq_dirs.append((scene_dir, sample_id, batch_dir, window_id, window_num_items))
     return seq_dirs
 
@@ -257,7 +374,10 @@ class FullResVFIDataset(Dataset):
     interior frame picked per-epoch (seeded) on every __getitem__ -- see
     set_epoch(). Each item also carries its accumulation window's id and
     true item count (window_id, window_num_items) -- see this module's
-    docstring.
+    docstring. As of this revision, __getitem__'s per-item return shape
+    is UNCHANGED -- batching is applied afterward, by DataLoader, via
+    BatchUidGroupedSampler + ragged_collate (see below). This dataset
+    class itself has no notion of batching.
 
     If max_frame_span is set and a scene's frame count exceeds it, a
     random contiguous sub-clip (length in [3, max_frame_span], also
@@ -269,7 +389,9 @@ class FullResVFIDataset(Dataset):
     _list_val_seq_dirs). Every interior frame of every sequence is
     enumerated once at construction (capped via val_max_interior_per_seq),
     fixed order, deterministic across epochs. NOT affected by
-    max_frame_span -- val always spans the full scene.
+    max_frame_span -- val always spans the full scene. Val is also NOT
+    affected by batch_uid grouping -- train.py's val_loader still uses a
+    plain DataLoader (see make_val_loader in train.py).
     """
 
     def __init__(self, split_dir, mode, frame_names, image_extensions, pad_multiple,
@@ -358,7 +480,10 @@ class FullResVFIDataset(Dataset):
         attribute updates made in the parent process. train.py's
         DataLoader explicitly sets persistent_workers=False for this
         reason; if that ever changes, this method stops propagating to
-        workers silently.
+        workers silently. This is unaffected by BatchUidGroupedSampler --
+        the sampler only decides which indices get grouped into a step,
+        it doesn't change how/when Dataset attributes propagate to
+        workers.
         """
         self.epoch = epoch
 
@@ -412,9 +537,13 @@ class FullResVFIDataset(Dataset):
         img1_t, _, _ = self._to_padded_tensor(img1)
 
         if self.mode == 'train':
-            # (num_interior, C, H, W) -- num_interior varies per item, but
-            # DataLoader batch_size=1 means default collate just adds a
-            # leading dim of 1, so no custom collate_fn is needed.
+            # (num_interior, C, H, W) -- num_interior varies per item. As of
+            # this revision, DataLoader batch_size can be > 1 (see
+            # BatchUidGroupedSampler), so ragged_collate (below) -- not
+            # default collate -- is responsible for padding this to a
+            # per-minibatch T_max and building a valid_mask. This function
+            # itself still returns exactly one scene's (possibly ragged)
+            # data; it has no knowledge of what else will land in its batch.
             gt_stack = torch.stack(
                 [self._to_padded_tensor(self._load(seq_dir, name))[0] for name in gt_names], dim=0)
             timesteps_t = torch.tensor(timesteps, dtype=torch.float32)
@@ -426,12 +555,151 @@ class FullResVFIDataset(Dataset):
         return (img0_t, gt_t, img1_t, torch.tensor(timestep, dtype=torch.float32), h, w)
 
 
+class BatchUidGroupedSampler(torch.utils.data.Sampler):
+    """Groups a train FullResVFIDataset's flat item list into one index
+    list per physical batch_uid (== one BatchNNN_<res>/ folder written by
+    curriculum_builder.py), in curriculum order both across and within
+    groups.
+
+    This is what actually turns "dynamic batch_size" from a purely
+    gradient-accumulation-over-singles concept into REAL batching: every
+    scene sharing a batch_uid shares exactly one padded resolution by
+    construction (curriculum_builder.py's group_into_batches invariant),
+    so grouping on batch_uid is always safe to stack into one (B, C, H, W)
+    tensor -- no cropping, no cross-resolution padding, ever needed.
+
+    Because curriculum_builder.py's config.yaml dynamic_batch.thresholds
+    table typically assigns large batch_size at small resolutions and
+    batch_size=1 at large resolutions (to keep VRAM roughly constant
+    across native-resolution training), this sampler naturally produces
+    large real minibatches at low-resolution phases (where GPU
+    utilization benefits most from batching) and single-item "batches" at
+    high-resolution phases (where a single native-res forward pass
+    already saturates the GPU) -- with zero phase-conditional code
+    anywhere. What changes phase to phase is purely the resolution->
+    batch_size mapping in config.yaml, not this sampler or train.py's
+    loop structure.
+
+    Use as `DataLoader(train_set, batch_sampler=BatchUidGroupedSampler(train_set),
+    collate_fn=ragged_collate, ...)` -- batch_sampler (not batch_size +
+    sampler) because group sizes vary (they equal each batch folder's own
+    scene count, which for a trailing/undersized-adjacent full batch or a
+    replay group landing at a phase boundary can be smaller than the
+    resolution's configured batch_size).
+
+    Does NOT shuffle -- train.py's curriculum order (own progression +
+    interleaved replay + trailing partial windows) IS the intended
+    training order; shuffling groups or their contents here would undo
+    exactly what curriculum_builder.py spent its whole retain/export/
+    interleave pipeline building. This mirrors the shuffle=False rationale
+    already present in train.py's DataLoader construction for the
+    previous (batch_size=1) loader.
+    """
+
+    def __init__(self, dataset):
+        if dataset.mode != 'train':
+            raise ValueError('BatchUidGroupedSampler is only valid for mode="train" datasets '
+                              '(val is loaded natively, unbatched -- see make_val_loader in train.py)')
+        groups = {}
+        order = []
+        for idx, item in enumerate(dataset.items):
+            # item == (seq_dir, present, sample_id, batch_uid, window_id, window_num_items)
+            batch_uid = item[3]
+            if batch_uid not in groups:
+                groups[batch_uid] = []
+                order.append(batch_uid)
+            groups[batch_uid].append(idx)
+        # order[] preserves first-appearance order, which -- because
+        # dataset.items itself was built by iterating _list_train_seq_dirs's
+        # curriculum-ordered output -- is exactly the curriculum order of
+        # batch folders. Every idx within one group is similarly already in
+        # curriculum (scene-sort) order, since it was appended to
+        # dataset.items in that order too.
+        self.grouped_indices = [groups[uid] for uid in order]
+
+    def __iter__(self):
+        return iter(self.grouped_indices)
+
+    def __len__(self):
+        return len(self.grouped_indices)
+
+
+def ragged_collate(batch):
+    """Collate function for a batch_uid-grouped minibatch of TRAIN items
+    (see BatchUidGroupedSampler). Every item in `batch` shares exactly one
+    resolution (guaranteed by grouping on batch_uid, in turn guaranteed by
+    curriculum_builder.py's group_into_batches), so img0/img1 stack
+    trivially. What does NOT match across items is num_interior (each
+    scene's own frame-count / max_frame_span sub-clip draw is independent
+    -- see this module's docstring) -- gt and timesteps are padded to this
+    minibatch's own T_max = max(num_interior), and a `valid_mask`
+    (B, T_max) bool tensor is returned so train.py's loss computation can
+    exclude the padded slots and keep each item's loss weight independent
+    of how many interior frames it actually had (mirroring the pre-
+    batching `frame_losses.mean()` invariant, just computed per-item-
+    then-across-batch instead of per-item-then-across-steps).
+
+    batch_uid, window_id, and window_num_items are identical across every
+    item in `batch` by construction (they're stamped per BATCH FOLDER by
+    curriculum_builder.py, not per scene -- see _list_train_seq_dirs) --
+    taken from batch[0] here with no risk of a mismatched value hiding
+    among the rest of the group.
+
+    Returns a tuple matching train.py's unpacking:
+        (img0, gt, img1, timesteps, valid_mask, h, w,
+         batch_uid, window_id, window_num_items)
+    where:
+        img0, img1        : (B, C, H, W)
+        gt, timesteps      : (B, T_max, C, H, W) / (B, T_max) -- zero-padded
+                              past each item's own num_interior
+        valid_mask          : (B, T_max) bool -- True where gt/timesteps are
+                              real (not padding)
+        h, w                : (B,) int64 -- identical across the batch in
+                              practice (single resolution per group), kept
+                              per-item for symmetry with the val loader and
+                              so train.py can sanity-check if it wants to
+        batch_uid            : str, this group's source folder path
+        window_id            : str, this group's accumulation-window id
+        window_num_items      : int, this window's true total item count
+    """
+    B = len(batch)
+    T_max = max(item[1].shape[0] for item in batch)
+    C, H, W = batch[0][0].shape
+
+    img0 = torch.stack([item[0] for item in batch], dim=0)
+    img1 = torch.stack([item[2] for item in batch], dim=0)
+
+    gt = torch.zeros(B, T_max, C, H, W, dtype=batch[0][1].dtype)
+    timesteps = torch.zeros(B, T_max, dtype=torch.float32)
+    valid_mask = torch.zeros(B, T_max, dtype=torch.bool)
+
+    for b, (_, gt_stack, _, ts, *_rest) in enumerate(batch):
+        n = gt_stack.shape[0]
+        gt[b, :n] = gt_stack
+        timesteps[b, :n] = ts
+        valid_mask[b, :n] = True
+
+    h = torch.tensor([item[4] for item in batch], dtype=torch.int64)
+    w = torch.tensor([item[5] for item in batch], dtype=torch.int64)
+
+    # Identical across the group by construction -- see docstring above.
+    batch_uid = batch[0][6]
+    window_id = batch[0][7]
+    window_num_items = batch[0][8]
+
+    return img0, gt, img1, timesteps, valid_mask, h, w, batch_uid, window_id, window_num_items
+
+
 def prepare_datasets(cfg, phase, log=print):
     """
     Build the train Dataset for the given phase (1-4) plus the val
     Dataset. Both are read-only over a curriculum ALREADY BUILT by
     curriculum_builder.py -- this function does not split or shuffle
-    anything itself; run curriculum_builder.py first.
+    anything itself; run curriculum_builder.py first. This function
+    itself is unaffected by the batching revision -- it still returns
+    plain FullResVFIDataset objects; train.py is responsible for wrapping
+    train_set in a DataLoader with BatchUidGroupedSampler + ragged_collate
+    (see that file's make_train_loader).
 
     data.max_frame_span_by_phase (config.yaml) is looked up for this
     phase and passed into the train Dataset as max_frame_span -- a

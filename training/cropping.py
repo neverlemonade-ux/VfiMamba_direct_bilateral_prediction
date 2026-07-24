@@ -19,7 +19,7 @@ Point augmentation.py's data.data_root at THIS script's data.output_root
 (or train on this script's output directly if you don't need pixel
 augmentation).
 
-    python cropping.py --config cropping_config.yaml
+    python cropping.py --config cropping.yaml
 
 === INPUT LAYOUT ===
 data.input_root is a folder containing one subfolder per scene, each
@@ -225,7 +225,7 @@ import cv2
 import numpy as np
 import yaml
 
-from dataset import seed_everything  # reuse -- one seeding implementation, not two
+from seeding import seed_everything  # reuse -- one seeding implementation, not two
 
 
 # ============================================================
